@@ -1,0 +1,95 @@
+name: "Update Homebrew Formula"
+description: "A reusable homebrew formula action that checks out a taps code and updates the given formula"
+
+inputs:
+  formula-name:
+    description: "The name of the formula to update"
+    required: true
+  formula-tag:
+    description: "The tag of the formula file"
+    required: true
+  formula-hash:
+    description: "The SHA256 hash of the formula file"
+    required: true
+  owner:
+    description: "The owner of the formula"
+    required: true
+  repo:
+    description: "The repository of the formula"
+    required: false
+    default: "formula-name"
+  branch:
+    description: "The branch of the formula"
+    required: false
+    default: "main"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Add JQ
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+    - name: Add JQ
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+    - name: Add JQ
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+    - name: Add JQ
+      uses: actions/setup-node@v4
+      run: |
+        # Initialize updates file
+        echo "[]" > /tmp/updates.json
+
+        # Process each formula
+        cat /tmp/formulas.jsonl | while IFS= read -r formula; do
+          gh api "repos/${{OWNER}}/${{REPO}}/releases/latest" | jq -f .github/jq/process-release.jq
+          gh api "repos/$OWNER/$REPO/tags" --jq '.[0:1]' 2>/dev/null
+        done
+
+        # Output the updates
+        echo "updates=$(cat /tmp/updates.json | jq -c '.')" >> $GITHUB_OUTPUT
+        echo "update_count=$(cat /tmp/updates.json | jq '. | length')" >> $GITHUB_OUTPUT
+
+    - name: Extract Info
+      uses: actions/setup-node@v4
+      with:
+        jq-file: .github/jq/process-release.jq
+      # Output
+      # - tag
+      # - url
+      # - type (tag/release)
+      # - sha256
+      # - version
+
+      # Calculate SHA256 for updates
+    - name: Calculate SHA256 hashes
+      id: calculate_sha
+      if: steps.check_releases.outputs.update_count > 0
+      run: |
+        # Process each update and add SHA256
+        UPDATES='${{ steps.check_releases.outputs.updates }}'
+        FINAL_UPDATES="[]"
+
+        echo "$UPDATES" | jq -c '.[]' | while IFS= read -r update; do
+          URL=$(echo "$update" | jq -r '.url')
+          REPO=$(echo "$update" | jq -r '.repo')
+          TAG=$(echo "$update" | jq -r '.tag')
+
+          echo "Calculating SHA256 for $REPO:$TAG..."
+
+          # Download and calculate SHA256
+          curl -sL "$URL" -o "/tmp/${REPO}-${TAG}.tar.gz"
+          SHA256=$(shasum -a 256 "/tmp/${REPO}-${TAG}.tar.gz" | cut -d' ' -f1)
+          rm "/tmp/${REPO}-${TAG}.tar.gz"
+
+          # Add SHA256 to update entry
+          UPDATE_WITH_SHA=$(echo "$update" | jq --arg sha256 "$SHA256" '. + {sha256: $sha256}')
+          echo "$UPDATE_WITH_SHA" >> /tmp/updates_with_sha.jsonl
+        done
+
+        # Convert back to JSON array
+        echo "updates_with_sha=$(cat /tmp/updates_with_sha.jsonl | jq -s -c '.')" >> $GITHUB_OUTPUT
