@@ -18,11 +18,11 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Setup jq
-      uses: vegardit/setup-jq-action@v1
+    - name: Install jq
+      uses: dcarbone/install-jq-action@v3.2.0
       with:
-        version: 1.7
-
+        version: "1.8.0"
+        force: true
     # TODO: Create step to install sponge
     # TODO: Create step to validate json object is valid json
     # TODO: Create step to validate json object against schema
