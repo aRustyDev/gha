@@ -20,30 +20,40 @@ jobs:
       pull-requests: write
     outputs:
       has_updates: ${{ steps.check_updates.outputs.has_updates }}
-      existing: ${{ steps.check_updates.outputs.updates }}
+      existing: ${{ steps.formulas.outputs.unique }}
+      repos: ${{ steps.repos.outputs.unique }}
     steps:
       - name: Checkout tap repository
         uses: actions/checkout@v4
 
       # Setup JQ
       - name: JQ #
-        uses: ./.github/actions/run-jq
+        uses: aRustyDev/gha/actions/run-jq
         with:
           jq-file: .github/jq/parse-formula.jq
           json-file: .data/formula.json
           formula: ${{ inputs.formula }}
 
       # Get unique formulas
-      - name: JQ #
+      - name: Unique Formulas #
         id: formulas
-        uses: ./.github/actions/run-jq
+        uses: aRustyDev/gha/actions/run-jq
+        with:
+          jq-file: .github/jq/parse-formula.jq
+          json-file: .data/formula.json
+          formula: ${{ inputs.formula }}
+
+      # Get unique repos
+      - name: Unique Repos #
+        id: repos
+        uses: aRustyDev/gha/actions/run-jq
         with:
           jq-file: .github/jq/parse-formula.jq
           json-file: .data/formula.json
           formula: ${{ inputs.formula }}
 
   # Use the GH API to check target repos for new releases/tags
-  check-for-updates:
+  identify-gaps:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -53,40 +63,7 @@ jobs:
       formulas: ${{ steps.check_updates.outputs.updates }}
     strategy:
       matrix:
-        formula: ${{ jobs.load-existing-formulas.outputs.existing }}
-    steps:
-      # Check each formula for updates
-      - name: Check formula updates
-        id: check_releases
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        uses: ./.github/actions/check-formula
-        with:
-          formulas: ${{ matrix.formula.name }}
-
-  # This should only run if new releases or tags are found
-  # Requirements:
-  #   - Use outputs from check-for-updates
-  #   - For each new release/tag
-  #     - create new branch to create the changes on
-  #     - Add its info to .data/formula.json
-  #     - Update the related formula using mustache templates
-  #     - Create a pull request for the formula update
-  #       - target the 'integration' branch
-  #       - assign to @aRustyDev
-  #       - Use template to generate the pull request title and body
-  #   - NOTE: may parallelize this step/job
-  update-formulas:
-    needs: check-for-updates
-    if: needs.check-for-updates.outputs.has_updates == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-      issues: write
-    strategy:
-      matrix:
-        formula: ${{ jobs.check-for-updates.outputs.formulas }}
+        repos: ${{ jobs.load-existing-formulas.outputs.repos }}
     steps:
       - name: Checkout tap repository
         uses: actions/checkout@v4
@@ -96,62 +73,34 @@ jobs:
         with:
           version: 1.7
 
-      - name: Add Mustache CLI
-        uses: actions/setup-node@v4
+      # Check each formula for updates
+      - name: Check formula updates
+        id: check_releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: aRustyDev/gha/actions/check-formula
         with:
-          node-version: ${{ inputs.node-version }}
+          formulas: ${{ matrix.repos }}
 
-      - name: Create new branch
-        run: |
-          TODO@CLAUDE: Task 002
-          git checkout -b feat/auto/update/${{ matrix.formula.name }}-${{ github.event.number }}
-
-      - name: Update formula.json
-        run: |
-          TODO@CLAUDE: Task 003
-          #  - Use jq to update the file
-          #  - Use jq script file
-          #  - jq script file should live in .github/jq/update-formula.jq
-
-      - name: Update target Formula
-        run: |
-          TODO@CLAUDE: Task 004
-
-      - name: Create Markdown Files from Mustache Templates
-        run: |
-          TODO@CLAUDE: Task 005
-
-      - name: Commit Changes
-        run: |
-          TODO@CLAUDE: Task 006
-          #  - Only target .data/formula.json
-          #  - Only target Formula/<n>/<Formula>.rb
-
-      - name: Create Issue
-        id: latest_release
-        run: |
-          TODO@CLAUDE: Task 007
-          gh issue create
-            --title develop
-            --body-file ".templates/issues/formula_update.md"
-            --assignee @aRustyDev,hubot
-            --label auto-update
-            --repo user/repo
-
-      - name: Create Pull Request
-        id: latest_release
-        run: |
-          TODO@CLAUDE: Task 008
-          # Needs to delete branch on acceptance
-          gh issue create
-            --template ".templates/issues/formula_update.md"
-            --base develop
-            --head monalisa:feature
-            --assignee monalisa,hubot
-            --label
-            --repo user/repo
-            --title develop
-            --body-file ".templates/issues/formula_update.md"
-            --assignee @aRustyDev,hubot
-            --label auto-update
-            --repo user/repo
+  # Use the GH API to check target repos for new releases/tags
+  update-missing:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      has_updates: ${{ steps.check_updates.outputs.has_updates }}
+      formulas: ${{ steps.check_updates.outputs.updates }}
+    strategy:
+      matrix:
+        repos: ${{ jobs.identify-gaps.outputs.missing }}
+        versions: ${{ jobs.identify-gaps.outputs.versions }}
+    steps:
+      # Check each formula for updates
+      - name: Update formula
+        id: check_releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: aRustyDev/gha/actions/update-formula
+        with:
+          formulas: ${{ matrix.repos }}
