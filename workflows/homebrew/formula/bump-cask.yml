@@ -1,0 +1,82 @@
+name: Create PR in aRustyDev/homebrew-tap
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches: [main, develop] # Only run for PRs targeting main or develop
+    paths:
+      - "src/**" # Only run if changes are in the src directory
+  push:
+    branches:
+      - main # Trigger on push to main branch
+
+jobs:
+  create-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          repository: aRustyDev/homebrew-tap
+          path: "Formula/REPLACE_WITH_CHAR1/{{ github.repository }}.rb"
+          ref: main
+          sparse-checkout: ""
+          fetch-depth: "1"
+          # SSH key used to fetch the repository. The SSH key is configured with the local
+          # git config, which enables your scripts to run authenticated git commands. The
+          # post-job step removes the SSH key.
+          #
+          # We recommend using a service account with the least permissions necessary.
+          #
+          # [Learn more about creating and using encrypted secrets](https://help.github.com/en/actions/automating-your-workflow-with-github-actions/creating-and-using-encrypted-secrets)
+          ssh-key: ""
+
+          # Known hosts in addition to the user and global host key database. The public SSH
+          # keys for a host may be obtained using the utility `ssh-keyscan`. For example,
+          # `ssh-keyscan github.com`. The public key for github.com is always implicitly
+          # added.
+          ssh-known-hosts: ""
+
+          # Whether to perform strict host key checking. When true, adds the options
+          # `StrictHostKeyChecking=yes` and `CheckHostIP=no` to the SSH command line. Use
+          # the input `ssh-known-hosts` to configure additional hosts.
+          # Default: true
+          ssh-strict: ""
+
+          # The user to use when connecting to the remote SSH host. By default 'git' is
+          # used.
+          # Default: git
+          ssh-user: ""
+
+      - name: Update formula
+        run: date +%s > report.txt
+
+      - name: Create commits
+        run: |
+          git config user.name 'Peter Evans'
+          git config user.email 'peter-evans@users.noreply.github.com'
+          date +%s > report.txt
+          git commit -am "Modify tracked file during workflow"
+          date +%s > new-report.txt
+          git add -A
+          git commit -m "Add untracked file during workflow"
+
+      - name: Create PR in aRustyDev/homebrew-tap
+        uses: peter-evans/create-pull-request@v7
+        with:
+          target_repo: "aRustyDev/homebrew-tap" # Replace with target repo
+          branch: "chore/bump/${{ github.repository }}" # Replace with target branch
+          base: "main" # Replace with source branch
+          github_token: ${{ secrets.PAT_TOKEN }} # Use your stored PAT secret
+          title: "Automated PR from source-repo"
+          body: "This PR was created automatically by a workflow in source-repo."
+          labels: |
+            bumpver
+            automated pr
+          assignees: "aRustyDev"
+          reviewers: "aRustyDev"
+          # body-path: ""
+          commit-message: "This PR was created automatically by a workflow in source-repo."
+          author: ${{ github.actor }} <${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com>
+          signoff: true
+          sign-commits: true
