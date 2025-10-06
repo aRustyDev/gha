@@ -7,11 +7,16 @@ class {{name}} < Formula
     version "{{tag}}"
     sha256 "{{sha256}}"
     license "{{license}}"
+    head "https://github.com/PromptExecution/just-mcp.git", branch: "main"
 
-    depends_on "rust" => :build
+    {{#deps_build}}
+    depends_on "{{dep}}" => :build
+    {{/deps_build}}
 
     def install
-      system "cargo", "install", *std_cargo_args
+      {{#install_steps}}
+      {{step}}
+      {{/install_steps}}
     end
 
     test do
