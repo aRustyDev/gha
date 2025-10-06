@@ -1,0 +1,102 @@
+name: "Update Homebrew Formula"
+description: "A reusable homebrew formula action that checks out a taps code and updates the given formula"
+
+inputs:
+  owner:
+    description: "The owner of the formula"
+    required: true
+  repo:
+    description: "The repository of the formula"
+    required: true
+  last_updated:
+    description: "The repository of the formula"
+    required: false
+    default: ""
+
+outputs:
+  info:
+    description: "Full Repo Info Object"
+    value: ${{ steps.formulas.outputs.formulas }}
+  repo:
+    description: "Repo Info Objects"
+    value: ${{ steps.repo.outputs.repo }}
+  tags:
+    description: "Repo Tag Objects"
+    value: ${{ steps.tags.outputs.tags }}
+  releases:
+    description: "Repo Release Objects"
+    value: ${{ steps.releases.outputs.releases }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Verify JQ
+      shell: bash
+      run: |
+        if ! command -v jq &> /dev/null; then
+          echo "jq is not installed" >&2
+          exit 1;
+        fi
+
+    - name: Verify Mustache
+      shell: bash
+      run: |
+        if ! command -v mustache &> /dev/null; then
+          echo "Mustache is not installed" >&2
+          exit 1;
+        fi
+
+    - name: Get Repository Info
+      id: repo
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        repo=$(gh repo view "${{ inputs.owner }}/${{ inputs.repo }}" \
+          --json \
+              description, \
+              url, \
+              owner, \
+              name, \
+              languages, \
+              licenseInfo, \
+              homepageUrl, \
+              latestRelease, \
+              isArchived)
+        echo "repo=$repo" >> $GITHUB_OUTPUT
+
+    - name: Get Tag Info
+      id: tags
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        tags=$(gh api \
+          -H "Accept: application/vnd.github+json" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          "/repo/${{ inputs.owner }}/${{ inputs.repo }}/releases" | jq -f ./jq/gh-releases.jq)
+        echo "tags=$tags" >> $GITHUB_OUTPUT
+
+    - name: Get Release Info
+      id: releases
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        releases=$(gh api \
+          -H "Accept: application/vnd.github+json" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          "/repo/${{ inputs.owner }}/${{ inputs.repo }}/tags" | jq -f ./jq/gh-releases.jq)
+        echo "releases=$releases" >> $GITHUB_OUTPUT
+
+    - name: Merge json
+      id: formulas
+      shell: bash
+      run: |
+        # Map/Merge tags + releases
+        versions=$(jq -n --argjson a '${{ steps.tags.outputs.tags }}' --argjson b '${{ steps.releases.outputs.tags }}' '$a * $b')
+
+        # Map/Merge (tags + releases) + repo
+        formulas=$(jq -n --argjson v $versions --argjson r '${{ steps.repo.outputs.repo }}' '$r + $v')
+
+        echo "formulas=$formulas" >> $GITHUB_OUTPUT
