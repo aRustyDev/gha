@@ -38,14 +38,25 @@ inputs:
     description: "The target branch of the formula; will create a pull request to it"
     required: false
     default: "main"
+  formula-json:
+    description: "The target branch of the formula; will create a pull request to it"
+    required: false
+    default: "{}"
 
 runs:
   using: "composite"
   steps:
-    - name: Verify dependencies (JQ + Mustache CLI)
-      shell: bash
-      run: |
-        TODO@CLAUDE
+    - name: Add Mustache CLI
+      if: ${{ steps.check_releases.outputs.has_updates == 'true' }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Add JQ CLI
+      if: ${{ steps.check_releases.outputs.has_updates == 'true' }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
 
     - name: Format Job Vars
       id: vars
@@ -53,8 +64,9 @@ runs:
       run: |
         formula=$(echo "${{ inputs.formula-name }}" | tr '[:upper:]' '[:lower:]')
         c=${formula:0:1}
+        formula-json=$()
 
-    - name: Update .data/formula.json
+    - name: Diff .data/formula.json
       uses: .github/actions/run-jq
       with:
         json-file: .data/formula.json
@@ -80,7 +92,7 @@ runs:
     - name: Create Markdown Files from Mustache Templates
       shell: bash
       run: |
-        TODO@CLAUDE: Task 005
+        echo "${{ steps.vars.outputs.formula }}" | mustache ./templates/formula.mustache
 
     - name: Parse config file
       uses: edgardleal/mustache-template-action@v1.0.4
