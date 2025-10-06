@@ -1,0 +1,135 @@
+name: "Update Homebrew Formula"
+description: "A reusable homebrew formula action that checks out a taps code and updates the given formula"
+
+inputs:
+  formula-name:
+    description: "The name of the formula to update"
+    required: true
+  formula-tag:
+    description: "The tag of the formula file"
+    required: true
+  formula-hash:
+    description: "The SHA256 hash of the formula file"
+    required: true
+  owner:
+    description: "The owner of the formula"
+    required: true
+  repo:
+    description: "The repository of the formula"
+    required: false
+    default: "formula-name"
+  branch:
+    description: "The branch of the formula"
+    required: false
+    default: "feat/auto-update-${{ inputs.formula-name }}"
+  target:
+    description: "The target branch of the formula; will create a pull request to it"
+    required: false
+    default: "main"
+  pr-template:
+    description: "The target branch of the formula; will create a pull request to it"
+    required: false
+    default: "main"
+  issue-template:
+    description: "The target branch of the formula; will create a pull request to it"
+    required: false
+    default: "main"
+  issue-template-name:
+    description: "The target branch of the formula; will create a pull request to it"
+    required: false
+    default: "main"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Verify dependencies (JQ + Mustache CLI)
+      shell: bash
+      run: |
+        TODO@CLAUDE
+
+    - name: Format Job Vars
+      id: vars
+      shell: bash
+      run: |
+        formula=$(echo "${{ inputs.formula-name }}" | tr '[:upper:]' '[:lower:]')
+        c=${formula:0:1}
+
+    - name: Update .data/formula.json
+      uses: .github/actions/run-jq
+      with:
+        json-file: .data/formula.json
+        jq-file: .github/jq/update-formulas.jq
+        argjson: --argjson $new
+        json: |
+          {
+            "owner": "${{ inputs.owner }}",
+            "repo": "${{ inputs.repo }}",
+            "formula": "${{ steps.vars.outputs.formula }}",
+            "created": "${{ inputs.created }}",
+            "tag": "${{ inputs.formula-tag }}",
+            "sha256": "${{ inputs.formula-hash }}"
+          }
+
+    - name: Update Formula
+      shell: bash
+      run: |
+        TODO@CLAUDE
+        sed -i '' 's/old_version/new_version/g' Formula/${{ steps.vars.outputs.c }}/${{ steps.vars.outputs.formula }}.rb
+        sed -i '' 's/old_version/new_version/g' Formula/${{ steps.vars.outputs.c }}/${{ steps.vars.outputs.formula }}.rb
+
+    - name: Create Markdown Files from Mustache Templates
+      shell: bash
+      run: |
+        TODO@CLAUDE: Task 005
+
+    - name: Parse config file
+      uses: edgardleal/mustache-template-action@v1.0.4
+      env:
+        ENV: dev
+      with:
+        input: .github/templates/prs/formula_update.mustache
+        output: .github/templates/issues/formula_update.md
+
+    - name: Parse config file
+      uses: edgardleal/mustache-template-action@v1.0.4
+      env:
+        ENV: dev
+      with:
+        input: .github/templates/issues/formula_update.mustache
+        output: .github/templates/issues/formula_update.md
+
+    - uses: JasonEtco/create-an-issue@v2
+      id: create-issue
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        filename: .github/templates/issues/formula_update.md
+      # output: ${{ steps.create-issue.outputs.number }}
+      # output: ${{ steps.create-issue.outputs.url }}
+
+    - name: Commit Changes
+      id: commit
+      uses: EndBug/add-and-commit@v9
+      with:
+        author_name: Claude
+        author_email: Claude
+        commit: --signoff
+        committer_name: Committer Name
+        committer_email: mail@example.com
+        message: "Your commit message"
+        new_branch: feat/auto/update/${{ inputs.formula-name }}-${{ github.event.number }}
+        add:
+          - .data/formula.json
+          - Formula/<n>/<Formula>.rb
+
+    - name: Create Pull Request
+      id: pull-request
+      uses: peter-evans/create-pull-request@v7
+      with:
+        title: "Update ${inputs.formula-name} to version ${inputs.version}"
+        body-path: .github/templates/prs/formula_update.md
+        labels: automation,formula,update
+        assignees: aRustyDev
+        reviewers: aRustyDev
+        branch: feat/auto/update/${{ inputs.formula-name }}-${{ github.event.number }}
+        base: integration
