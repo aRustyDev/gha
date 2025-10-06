@@ -1,0 +1,137 @@
+name: "GH Release Install"
+description: "A reusable install action using GH Cli to install a github releases"
+author: "aRustyDev"
+
+inputs:
+  repo:
+    required: true
+    description: "GitHub repo where binary is located"
+  tag:
+    required: true
+    description: "tag containing binary to install"
+    default: latest
+  token:
+    required: false
+    description: "GITHUB_TOKEN or a `repo` scoped Personal Access Token (PAT)"
+    default: ${{ github.token }}
+  platform:
+    required: false
+    description: |
+      "OS Platform to match in release package.
+      Specify this parameter if the repository releases do not follow a normal convention otherwise it will be auto-detected."
+    default: uname
+  arch:
+    required: false
+    description: |
+      "OS Architecture to match in release package.
+      Specify this parameter if the repository releases do not follow a normal convention otherwise it will be auto-detected."
+    default: uname
+  extension:
+    required: false
+    description: |
+      "Custom file extension to match in release package.
+      Specify this parameter if the repository releases do not provide a .tar.gz or .zip format release."
+  extension-matching:
+    required: false
+    description: |
+      "Enable/disable file extension matching in release package.
+      Specify this parameter if the repository releases do not have a file extension e.g. they are pure binaries."
+    default: enable
+  rename-to:
+    required: false
+    description: |
+      "When installing a release that is not an archive, e.g. a pure binary, this controls how the downloaded release asset is renamed.
+      Specify this parameter if installing a non-archive release."
+  chmod:
+    required: false
+    description: |
+      "When installing a release that is not an archive, e.g. a pure binary, this controls how the downloaded release asset is chmod'd.
+      Specify this parameter if installing a non-archive release and you need to change its permissions e.g. make it executable."
+  cache:
+    required: false
+    description: "When set to 'enable', caches the downloads of known tags with actions/cache"
+  binaries-location:
+    required: false
+    description: |
+      "Specify this parameter if the binaries are not located in the root of the release archive.
+      The parameter should be a relative path to the release archive.
+      For example, if the binaries are located in the 'bin' directory of the release archive, the parameter should be 'bin'."
+    default: "/usr/bin"
+  asset-name:
+    required: false
+    description: "Use this parameter to specify the name of the asset to download if the repo has multiple assets."
+  prerelease:
+    required: false
+    description: "Consider prerelease for latest tag"
+    default: "false"
+  digest:
+    required: false
+    description: |
+      "SHA256 digest of the release asset.
+      Specify this parameter to verify the integrity of the downloaded asset."
+
+  # apiUrl,assets,author,body,createdAt,databaseId,id,isDraft,isImmutable,
+  # isPrerelease,name,publishedAt,tagName,tarballUrl,targetCommitish,
+  # uploadUrl,url,zipballUrl
+
+# outputs:
+#   info:
+#     description: "Full Repo Info Object"
+#     value: ${{ steps.formulas.outputs.formulas }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Format Variables
+      shell: bash
+      id: vars
+      run: |
+        release=$(gh release view ${{ inputs.tag }} \
+        --repo ${{ inputs.repo }} \
+        --json "apiUrl,createdAt,assets,databaseId,id,isDraft,isImmutable,isPrerelease,name,publishedAt,tagName,tarballUrl,uploadUrl,url,zipballUrl")
+
+        prerelease=$(echo $release | jq -r '.isPrerelease')
+        immutable=$(echo $release | jq -r '.isImmutable')
+        draft=$(echo $release | jq -r '.isDraft')
+        arch=if ${{ inputs.arch }} == "uname"; then $(uname -m); fi
+        os=if ${{ inputs.platform }} == "uname"; then $(uname -o); fi
+        patterns="-p '*$arch*$os*' -p '*$arch*$os*'"
+        name=if ${{ inputs.rename-to }} == ""; then $(echo $release | jq -r '.name' | cut -f 1 -d " "); else echo "${{ inputs.rename-to }}" fi
+        tag=${{ inputs.tag == 'latest' && '' || ${{ inputs.tag }} }}
+        digest=$(echo $release | jq -r --arg arch "$arch" --arg os "$os" '.assets[] | select( .name | contains($arch) and contains($os)) | .')
+
+        echo "prerelease=$prerelease" >> $GITHUB_OUTPUT
+        echo "immutable=$immutable" >> $GITHUB_OUTPUT
+        echo "patterns=$patterns" >> $GITHUB_OUTPUT
+        echo "release=$release" >> $GITHUB_OUTPUT
+        echo "name=$name" >> $GITHUB_OUTPUT
+        echo "draft=$draft" >> $GITHUB_OUTPUT
+        echo "arch=$arch" >> $GITHUB_OUTPUT
+        echo "os=$os" >> $GITHUB_OUTPUT
+
+    - name: Check Prerelease
+      if: ${{ inputs.prerelease == 'true' }}
+      shell: bash
+      run: |
+        if [[ ${{ steps.vars.outputs.prerelease }} != "true" ]]; then
+          echo "${{ inputs.repo }}@${{ inputs.tag }} is not a Prerelease"
+          exit 1
+        fi
+
+    - name: Install single asset
+      id: download
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        gh release download ${{ steps.vars.outputs.tag }} \
+          --repo ${{ inputs.repo }} \
+          --clobber \
+          --dir ${{ inputs.binaries-location }} \
+          --output ${{ steps.vars.outputs.name }} \
+          ${{ steps.vars.outputs.patterns }}
+
+    - name: Chmod
+      shell: bash
+      run: |
+        chmod +${{ inputs.chmod }} ${{ inputs.binaries-location }}/${{ steps.vars.outputs.name }}
