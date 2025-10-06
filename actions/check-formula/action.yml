@@ -26,70 +26,21 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Add JQ
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ inputs.node-version }}
-    - name: Add JQ
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ inputs.node-version }}
-    - name: Add JQ
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ inputs.node-version }}
-    - name: Add JQ
-      uses: actions/setup-node@v4
+    - name: Get Repo Info
+      id: repo
+      uses: ./.github/actions/repo-info
+
+    - name: Diff Repo Info for new releases/tags
+      id: diff
+      shell: bash
       run: |
-        # Initialize updates file
-        echo "[]" > /tmp/updates.json
+        # Diff ${{ steps.repo.outputs.info }}
 
-        # Process each formula
-        cat /tmp/formulas.jsonl | while IFS= read -r formula; do
-          gh api "repos/${{OWNER}}/${{REPO}}/releases/latest" | jq -f .github/jq/process-release.jq
-          gh api "repos/$OWNER/$REPO/tags" --jq '.[0:1]' 2>/dev/null
-        done
-
-        # Output the updates
-        echo "updates=$(cat /tmp/updates.json | jq -c '.')" >> $GITHUB_OUTPUT
+    - name: Get Missing Formulas
+      if: ${{ steps.diff.outputs.latest != inputs.updated_at }}
+      id: missing
+      shell: bash
+      run: |
+        # Diff ${{ steps.repo.outputs.info }}
+        echo "missing=$(cat /tmp/updates.json | jq -c '.')" >> $GITHUB_OUTPUT
         echo "update_count=$(cat /tmp/updates.json | jq '. | length')" >> $GITHUB_OUTPUT
-
-    - name: Extract Info
-      uses: actions/setup-node@v4
-      with:
-        jq-file: .github/jq/process-release.jq
-      # Output
-      # - tag
-      # - url
-      # - type (tag/release)
-      # - sha256
-      # - version
-
-      # Calculate SHA256 for updates
-    - name: Calculate SHA256 hashes
-      id: calculate_sha
-      if: steps.check_releases.outputs.update_count > 0
-      run: |
-        # Process each update and add SHA256
-        UPDATES='${{ steps.check_releases.outputs.updates }}'
-        FINAL_UPDATES="[]"
-
-        echo "$UPDATES" | jq -c '.[]' | while IFS= read -r update; do
-          URL=$(echo "$update" | jq -r '.url')
-          REPO=$(echo "$update" | jq -r '.repo')
-          TAG=$(echo "$update" | jq -r '.tag')
-
-          echo "Calculating SHA256 for $REPO:$TAG..."
-
-          # Download and calculate SHA256
-          curl -sL "$URL" -o "/tmp/${REPO}-${TAG}.tar.gz"
-          SHA256=$(shasum -a 256 "/tmp/${REPO}-${TAG}.tar.gz" | cut -d' ' -f1)
-          rm "/tmp/${REPO}-${TAG}.tar.gz"
-
-          # Add SHA256 to update entry
-          UPDATE_WITH_SHA=$(echo "$update" | jq --arg sha256 "$SHA256" '. + {sha256: $sha256}')
-          echo "$UPDATE_WITH_SHA" >> /tmp/updates_with_sha.jsonl
-        done
-
-        # Convert back to JSON array
-        echo "updates_with_sha=$(cat /tmp/updates_with_sha.jsonl | jq -s -c '.')" >> $GITHUB_OUTPUT
