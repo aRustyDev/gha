@@ -1,0 +1,25 @@
+name: "Install JQ"
+description: "A reusable install action for jq"
+
+inputs:
+  version:
+    required: false
+    description: "Version of jq to install"
+    default: "1.7.1"
+  force:
+    required: false
+    description: "Do not check for existing jq installation before continuing."
+    default: "false"
+
+# outputs:
+#   info:
+#     description: "Full Repo Info Object"
+#     value: ${{ steps.formulas.outputs.formulas }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install JQ
+      shell: bash
+      run: |
+        echo "TODO"
