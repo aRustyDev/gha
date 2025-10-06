@@ -1,0 +1,21 @@
+# {{repo}}.rb
+
+class {{name}} < Formula
+    desc "{{description}}"
+    homepage "https://github.com/{{user}}/{{repo}}"
+    url "https://github.com/{{user}}/{{repo}}/archive/{{tag}}.tar.gz"
+    version "{{tag}}"
+    sha256 "{{sha256}}"
+    license "{{license}}"
+
+    depends_on "rust" => :build
+
+    def install
+      system "cargo", "install", *std_cargo_args
+    end
+
+    test do
+      # this test runs `ghloc --version` and checks that it starts with "ghloc "
+      assert_match /^ghloc /, shell_output("#{bin}/ghloc --version")
+    end
+  end
