@@ -368,7 +368,7 @@ jobs:
       bump_type: ${{ steps.bump.outputs.bump_type }}
     steps:
       - name: Load secrets from 1Password
-        if: inputs.github_app_id_secret_ref != '' && secrets.OP_SERVICE_ACCOUNT_TOKEN != ''
+        if: inputs.github_app_id_secret_ref != ''
         id: op-secrets
         uses: 1password/load-secrets-action@v3
         with:
@@ -604,7 +604,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Load secrets from 1Password
-        if: inputs.github_app_id_secret_ref != '' && secrets.OP_SERVICE_ACCOUNT_TOKEN != ''
+        if: inputs.github_app_id_secret_ref != ''
         id: op-secrets
         uses: 1password/load-secrets-action@v3
         with:

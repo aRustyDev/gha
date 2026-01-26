@@ -78,7 +78,7 @@ jobs:
       artifacts: ${{ steps.detect.outputs.artifacts }}
     steps:
       - name: Load secrets from 1Password
-        if: inputs.github_app_id_secret_ref != '' && secrets.OP_SERVICE_ACCOUNT_TOKEN != ''
+        if: inputs.github_app_id_secret_ref != ''
         id: op-secrets
         uses: 1password/load-secrets-action@v3
         with:
