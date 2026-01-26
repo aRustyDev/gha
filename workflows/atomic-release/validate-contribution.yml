@@ -1,0 +1,458 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+#
+# Validate Contribution
+#
+# Reusable workflow that validates contributions with comprehensive checks
+# and generates attestations for each validation step.
+#
+# Jobs:
+#   - detect-changes: Identify changed artifacts
+#   - lint: Run linting (customizable command)
+#   - commit-validation: Conventional commit message validation
+#   - changelog: Per-artifact changelog generation
+#
+# Each job generates a GitHub attestation stored in the PR description.
+#
+# Usage:
+#   jobs:
+#     validate:
+#       uses: arustydev/gha/.github/workflows/atomic-release/validate-contribution.yml@v1
+#       with:
+#         artifact_path: "charts"
+#         manifest_file: "Chart.yaml"
+#         lint_command: "ct lint --config ct.yaml --target-branch $TARGET_BRANCH"
+#         target_branch: "integration"
+#       secrets: inherit
+
+name: Validate Contribution
+
+on:
+  workflow_call:
+    inputs:
+      artifact_path:
+        description: 'Path to artifacts directory (e.g., "charts", "crates")'
+        required: true
+        type: string
+      manifest_file:
+        description: 'Manifest file name within each artifact (e.g., "Chart.yaml", "Cargo.toml")'
+        required: true
+        type: string
+      target_branch:
+        description: 'Target branch for comparisons'
+        required: false
+        type: string
+        default: 'integration'
+      lint_command:
+        description: 'Lint command to run (can include $TARGET_BRANCH variable)'
+        required: false
+        type: string
+        default: ''
+      lint_setup_steps:
+        description: 'JSON array of setup steps to run before linting'
+        required: false
+        type: string
+        default: '[]'
+      commitlint_config:
+        description: 'Path to commitlint config file'
+        required: false
+        type: string
+        default: 'commitlint.config.mjs'
+      generate_changelog:
+        description: 'Generate changelog preview'
+        required: false
+        type: boolean
+        default: true
+      cliff_config:
+        description: 'Path to git-cliff config file'
+        required: false
+        type: string
+        default: '.github/cliff.toml'
+      test_all:
+        description: 'Test all artifacts (not just changed)'
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      changed_artifacts:
+        description: 'Space-separated list of changed artifacts'
+        value: ${{ jobs.detect-changes.outputs.changed_artifacts }}
+      artifacts_changed:
+        description: 'Boolean indicating if any artifacts changed'
+        value: ${{ jobs.detect-changes.outputs.artifacts_changed }}
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+  attestations: write
+
+jobs:
+  #############################################################################
+  # Detect changed artifacts and prepare for parallel jobs
+  #############################################################################
+  detect-changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      artifacts_changed: ${{ steps.detect.outputs.artifacts_changed }}
+      changed_artifacts: ${{ steps.detect.outputs.changed_artifacts }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed artifacts
+        id: detect
+        env:
+          ARTIFACT_PATH: ${{ inputs.artifact_path }}
+          MANIFEST_FILE: ${{ inputs.manifest_file }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          # Inline the detection logic to avoid requiring script download
+          RANGE="origin/$TARGET_BRANCH...HEAD"
+
+          ARTIFACTS=$(git diff --name-only "$RANGE" 2>/dev/null | \
+            grep "^${ARTIFACT_PATH}/" | \
+            cut -d'/' -f2 | \
+            sort -u | \
+            tr '\n' ' ' | \
+            xargs)
+
+          # Filter to only include directories with manifest files
+          VALID_ARTIFACTS=""
+          for artifact in $ARTIFACTS; do
+            if [[ -f "${ARTIFACT_PATH}/${artifact}/${MANIFEST_FILE}" ]]; then
+              VALID_ARTIFACTS="$VALID_ARTIFACTS $artifact"
+            else
+              echo "::notice::Skipping $artifact - no $MANIFEST_FILE found"
+            fi
+          done
+
+          VALID_ARTIFACTS=$(echo "$VALID_ARTIFACTS" | xargs)
+
+          if [[ -n "$VALID_ARTIFACTS" ]]; then
+            echo "artifacts_changed=true" >> "$GITHUB_OUTPUT"
+            echo "changed_artifacts=$VALID_ARTIFACTS" >> "$GITHUB_OUTPUT"
+            echo "::notice::Changed artifacts: $VALID_ARTIFACTS"
+          else
+            echo "artifacts_changed=false" >> "$GITHUB_OUTPUT"
+            echo "changed_artifacts=" >> "$GITHUB_OUTPUT"
+            echo "::notice::No artifact changes detected"
+          fi
+
+  #############################################################################
+  # Lint (Static Analysis) - Customizable
+  #############################################################################
+  lint:
+    name: lint
+    needs: detect-changes
+    if: >-
+      inputs.lint_command != '' &&
+      (needs.detect-changes.outputs.artifacts_changed == 'true' || inputs.test_all)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run lint command
+        id: lint
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          ARTIFACT_PATH: ${{ inputs.artifact_path }}
+          TEST_ALL: ${{ inputs.test_all }}
+        run: |
+          # Expand variables in lint command
+          LINT_CMD="${{ inputs.lint_command }}"
+          LINT_CMD=$(eval echo "$LINT_CMD")
+
+          echo "::group::Running lint command"
+          echo "Command: $LINT_CMD"
+          eval "$LINT_CMD"
+          echo "::endgroup::"
+
+      - name: Generate lint digest
+        id: digest
+        run: |
+          DIGEST=$(echo -n "lint-${{ github.sha }}" | sha256sum | cut -d' ' -f1)
+          echo "digest=sha256:$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Generate attestation
+        id: attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: "w1-lint"
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          push-to-registry: false
+
+      - name: Update attestation map
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Inline attestation map update logic
+          check_name="lint"
+          attestation_id="${{ steps.attestation.outputs.attestation-id }}"
+          pr_number="$PR_NUMBER"
+
+          # Get current PR body
+          body=$(gh pr view "$pr_number" --json body -q '.body' 2>/dev/null || echo "")
+
+          # Extract existing map or create new one
+          existing_map=$(echo "$body" | awk '
+            /<!-- ATTESTATION_MAP/,/-->/ {
+              if (!/<!-- ATTESTATION_MAP/ && !/-->/) print
+            }
+          ' | tr -d '\n' | xargs)
+
+          if [[ -z "$existing_map" ]]; then
+            existing_map='{}'
+          fi
+
+          # Update map with new attestation
+          updated_map=$(echo "$existing_map" | jq -c --arg k "$check_name" --arg v "$attestation_id" '. + {($k): $v}')
+
+          # Build new body
+          if echo "$body" | grep -qF "<!-- ATTESTATION_MAP"; then
+            new_body=$(echo "$body" | awk -v map="$updated_map" '
+              /<!-- ATTESTATION_MAP/,/-->/ {
+                if (/<!-- ATTESTATION_MAP/) { print "<!-- ATTESTATION_MAP"; print map; next }
+                if (/-->/) { print "-->"; next }
+                next
+              }
+              { print }
+            ')
+          else
+            new_body="$body
+
+          <!-- ATTESTATION_MAP
+          $updated_map
+          -->"
+          fi
+
+          gh pr edit "$pr_number" --body "$new_body"
+          echo "::notice::Updated attestation map: $check_name = $attestation_id"
+
+  #############################################################################
+  # Commit Message Validation
+  #############################################################################
+  commit-validation:
+    name: commit-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate commit messages
+        id: commitlint
+        uses: wagoid/commitlint-github-action@v6
+        with:
+          configFile: ${{ inputs.commitlint_config }}
+
+      - name: Generate validation digest
+        id: digest
+        run: |
+          DIGEST=$(echo -n "commit-validation-${{ github.sha }}" | sha256sum | cut -d' ' -f1)
+          echo "digest=sha256:$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Generate attestation
+        id: attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: "w1-commit-validation"
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          push-to-registry: false
+
+      - name: Update attestation map
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          check_name="commit-validation"
+          attestation_id="${{ steps.attestation.outputs.attestation-id }}"
+          pr_number="$PR_NUMBER"
+
+          body=$(gh pr view "$pr_number" --json body -q '.body' 2>/dev/null || echo "")
+
+          existing_map=$(echo "$body" | awk '
+            /<!-- ATTESTATION_MAP/,/-->/ {
+              if (!/<!-- ATTESTATION_MAP/ && !/-->/) print
+            }
+          ' | tr -d '\n' | xargs)
+
+          if [[ -z "$existing_map" ]]; then
+            existing_map='{}'
+          fi
+
+          updated_map=$(echo "$existing_map" | jq -c --arg k "$check_name" --arg v "$attestation_id" '. + {($k): $v}')
+
+          if echo "$body" | grep -qF "<!-- ATTESTATION_MAP"; then
+            new_body=$(echo "$body" | awk -v map="$updated_map" '
+              /<!-- ATTESTATION_MAP/,/-->/ {
+                if (/<!-- ATTESTATION_MAP/) { print "<!-- ATTESTATION_MAP"; print map; next }
+                if (/-->/) { print "-->"; next }
+                next
+              }
+              { print }
+            ')
+          else
+            new_body="$body
+
+          <!-- ATTESTATION_MAP
+          $updated_map
+          -->"
+          fi
+
+          gh pr edit "$pr_number" --body "$new_body"
+          echo "::notice::Updated attestation map: $check_name = $attestation_id"
+
+  #############################################################################
+  # Changelog Generation (Per-Artifact)
+  #############################################################################
+  changelog:
+    name: changelog
+    needs: detect-changes
+    if: inputs.generate_changelog && needs.detect-changes.outputs.artifacts_changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install git-cliff
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          GIT_CLIFF_VERSION=$(gh api repos/orhun/git-cliff/releases/latest --jq '.tag_name' | sed 's/^v//')
+          if [ -z "$GIT_CLIFF_VERSION" ] || [ "$GIT_CLIFF_VERSION" = "null" ]; then
+            GIT_CLIFF_VERSION="2.7.0"
+          fi
+          echo "::notice::Installing git-cliff v${GIT_CLIFF_VERSION}"
+          curl -sSL "https://github.com/orhun/git-cliff/releases/download/v${GIT_CLIFF_VERSION}/git-cliff-${GIT_CLIFF_VERSION}-x86_64-unknown-linux-gnu.tar.gz" | tar xz
+          sudo mv git-cliff-${GIT_CLIFF_VERSION}/git-cliff /usr/local/bin/
+          git-cliff --version
+
+      - name: Generate changelogs for changed artifacts
+        id: changelog
+        env:
+          CHANGED_ARTIFACTS: ${{ needs.detect-changes.outputs.changed_artifacts }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          ARTIFACT_PATH: ${{ inputs.artifact_path }}
+          CLIFF_CONFIG: ${{ inputs.cliff_config }}
+        run: |
+          echo "# Changelog Preview" > changelog.md
+          echo "" >> changelog.md
+
+          for artifact in $CHANGED_ARTIFACTS; do
+            echo "::group::Generating changelog for $artifact"
+            echo "## $artifact" >> changelog.md
+            echo "" >> changelog.md
+
+            CLIFF_ARGS=""
+            if [[ -f "$CLIFF_CONFIG" ]]; then
+              CLIFF_ARGS="--config $CLIFF_CONFIG"
+            fi
+
+            CHANGELOG_OUTPUT=$(git-cliff \
+              $CLIFF_ARGS \
+              --include-path "${ARTIFACT_PATH}/${artifact}/**/*" \
+              "origin/$TARGET_BRANCH..HEAD" \
+              --strip header 2>/dev/null) || true
+
+            if [[ -n "$CHANGELOG_OUTPUT" && ! "$CHANGELOG_OUTPUT" =~ ^[[:space:]]*$ ]]; then
+              echo "$CHANGELOG_OUTPUT" >> changelog.md
+            else
+              echo "_No conventional commits found for this artifact._" >> changelog.md
+            fi
+
+            echo "" >> changelog.md
+            echo "::endgroup::"
+          done
+
+          cat changelog.md
+
+      - name: Add changelog comment to PR
+        if: github.event_name == 'pull_request'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: changelog.md
+
+      - name: Generate changelog digest
+        id: digest
+        run: |
+          DIGEST=$(sha256sum changelog.md | cut -d' ' -f1)
+          echo "digest=sha256:$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Generate attestation
+        id: attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: "w1-changelog"
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          push-to-registry: false
+
+      - name: Update attestation map
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          check_name="changelog"
+          attestation_id="${{ steps.attestation.outputs.attestation-id }}"
+          pr_number="$PR_NUMBER"
+
+          body=$(gh pr view "$pr_number" --json body -q '.body' 2>/dev/null || echo "")
+
+          existing_map=$(echo "$body" | awk '
+            /<!-- ATTESTATION_MAP/,/-->/ {
+              if (!/<!-- ATTESTATION_MAP/ && !/-->/) print
+            }
+          ' | tr -d '\n' | xargs)
+
+          if [[ -z "$existing_map" ]]; then
+            existing_map='{}'
+          fi
+
+          updated_map=$(echo "$existing_map" | jq -c --arg k "$check_name" --arg v "$attestation_id" '. + {($k): $v}')
+
+          if echo "$body" | grep -qF "<!-- ATTESTATION_MAP"; then
+            new_body=$(echo "$body" | awk -v map="$updated_map" '
+              /<!-- ATTESTATION_MAP/,/-->/ {
+                if (/<!-- ATTESTATION_MAP/) { print "<!-- ATTESTATION_MAP"; print map; next }
+                if (/-->/) { print "-->"; next }
+                next
+              }
+              { print }
+            ')
+          else
+            new_body="$body
+
+          <!-- ATTESTATION_MAP
+          $updated_map
+          -->"
+          fi
+
+          gh pr edit "$pr_number" --body "$new_body"
+          echo "::notice::Updated attestation map: $check_name = $attestation_id"
+
+  #############################################################################
+  # Skip jobs for no-change scenarios (satisfies required checks)
+  #############################################################################
+  lint-skip:
+    name: lint
+    needs: detect-changes
+    if: >-
+      inputs.lint_command != '' &&
+      needs.detect-changes.outputs.artifacts_changed != 'true' &&
+      !inputs.test_all
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "No artifact changes detected, skipping lint"

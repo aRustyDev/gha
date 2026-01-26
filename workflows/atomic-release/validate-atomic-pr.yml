@@ -1,0 +1,661 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+#
+# Validate Atomic PR
+#
+# Reusable workflow that validates atomic PRs (one artifact per PR) and
+# automatically bumps versions based on conventional commits.
+#
+# This workflow:
+#   1. Validates PR source branch matches expected pattern
+#   2. Detects changed artifacts
+#   3. Runs custom validation/test commands
+#   4. Bumps version based on conventional commits
+#   5. Generates/updates CHANGELOG.md using git-cliff
+#   6. Commits changes back to PR branch
+#   7. Updates PR description with attestation map
+#   8. On merge: Cleans up source branch
+#
+# Usage:
+#   jobs:
+#     validate:
+#       uses: arustydev/gha/.github/workflows/atomic-release/validate-atomic-pr.yml@v1
+#       with:
+#         artifact_path: "charts"
+#         manifest_file: "Chart.yaml"
+#         branch_pattern: "charts/*"
+#         test_command: "ct install --config ct-install.yaml"
+#       secrets:
+#         OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+name: Validate Atomic PR
+
+on:
+  workflow_call:
+    inputs:
+      artifact_path:
+        description: 'Path to artifacts directory (e.g., "charts", "crates")'
+        required: true
+        type: string
+      manifest_file:
+        description: 'Manifest file name within each artifact'
+        required: true
+        type: string
+      branch_pattern:
+        description: 'Glob pattern for valid source branches (e.g., "charts/*")'
+        required: true
+        type: string
+      target_branch:
+        description: 'Target branch (usually "main")'
+        required: false
+        type: string
+        default: 'main'
+      lint_command:
+        description: 'Lint command to run before tests'
+        required: false
+        type: string
+        default: ''
+      test_command:
+        description: 'Test command to run'
+        required: false
+        type: string
+        default: ''
+      enable_version_bump:
+        description: 'Automatically bump version based on commits'
+        required: false
+        type: boolean
+        default: true
+      cliff_config:
+        description: 'Path to git-cliff config file'
+        required: false
+        type: string
+        default: 'cliff.toml'
+      allowed_dispatch_actors:
+        description: 'Comma-separated list of allowed actors for repository_dispatch'
+        required: false
+        type: string
+        default: 'github-actions[bot]'
+      github_app_id_secret_ref:
+        description: '1Password reference for GitHub App ID (for elevated permissions)'
+        required: false
+        type: string
+        default: ''
+      github_app_key_secret_ref:
+        description: '1Password reference for GitHub App private key'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      OP_SERVICE_ACCOUNT_TOKEN:
+        required: false
+        description: '1Password service account token for GitHub App credentials'
+    outputs:
+      artifact:
+        description: 'Detected artifact name'
+        value: ${{ jobs.validate-and-detect.outputs.artifact }}
+      version:
+        description: 'Version after bump (if bumped)'
+        value: ${{ jobs.version-bump.outputs.version }}
+      bumped:
+        description: 'Whether version was bumped'
+        value: ${{ jobs.version-bump.outputs.bumped }}
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: validate-atomic-${{ github.event.pull_request.number || github.event.client_payload.pr || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  # ==========================================================================
+  # Actor validation for repository_dispatch
+  # ==========================================================================
+  validate-dispatch:
+    if: github.event_name == 'repository_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      pr_number: ${{ steps.validate.outputs.pr_number }}
+      artifact: ${{ steps.validate.outputs.artifact }}
+      actor_valid: ${{ steps.validate.outputs.actor_valid }}
+    steps:
+      - name: Validate Actor and Extract Payload
+        id: validate
+        env:
+          ACTOR: ${{ github.actor }}
+          ALLOWED_ACTORS: ${{ inputs.allowed_dispatch_actors }}
+          PAYLOAD_PR: ${{ github.event.client_payload.pr }}
+          PAYLOAD_ARTIFACT: ${{ github.event.client_payload.artifact }}
+        run: |
+          echo "::group::Dispatch Validation"
+          echo "Actor: $ACTOR"
+          echo "Payload PR: $PAYLOAD_PR"
+          echo "Payload Artifact: $PAYLOAD_ARTIFACT"
+          echo "::endgroup::"
+
+          # Validate actor against allowed list
+          if [[ ! ",$ALLOWED_ACTORS," =~ ",$ACTOR," ]]; then
+            echo "::error::Unauthorized actor: $ACTOR (allowed: $ALLOWED_ACTORS)"
+            echo "actor_valid=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          echo "::notice::Actor validated: $ACTOR"
+          echo "actor_valid=true" >> "$GITHUB_OUTPUT"
+
+          if [[ -z "$PAYLOAD_PR" ]]; then
+            echo "::error::Missing required payload field: pr"
+            exit 1
+          fi
+
+          echo "pr_number=$PAYLOAD_PR" >> "$GITHUB_OUTPUT"
+          echo "artifact=$PAYLOAD_ARTIFACT" >> "$GITHUB_OUTPUT"
+
+  # ==========================================================================
+  # Validation jobs (skip on PR close)
+  # ==========================================================================
+  validate-and-detect:
+    needs: [validate-dispatch]
+    if: |
+      always() &&
+      github.event.action != 'closed' &&
+      (github.event_name != 'repository_dispatch' || needs.validate-dispatch.outputs.actor_valid == 'true')
+    runs-on: ubuntu-latest
+    outputs:
+      artifact: ${{ steps.detect.outputs.artifact }}
+      has_artifact: ${{ steps.detect.outputs.has_artifact }}
+      source_valid: ${{ steps.validate.outputs.valid }}
+      pr_number: ${{ steps.context.outputs.pr_number }}
+      head_ref: ${{ steps.context.outputs.head_ref }}
+      base_ref: ${{ steps.context.outputs.base_ref }}
+    steps:
+      - name: Determine PR Context
+        id: context
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          EVENT="${{ github.event_name }}"
+
+          if [[ "$EVENT" == "repository_dispatch" ]]; then
+            PR_NUMBER="${{ github.event.client_payload.pr }}"
+            echo "::notice::repository_dispatch: PR #$PR_NUMBER"
+          elif [[ "$EVENT" == "workflow_dispatch" ]]; then
+            PR_NUMBER="${{ github.event.inputs.pr_number }}"
+            echo "::notice::workflow_dispatch: PR #$PR_NUMBER"
+          else
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+            echo "::notice::pull_request: PR #$PR_NUMBER"
+          fi
+
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+          # For dispatch events, get PR details
+          if [[ "$EVENT" == "repository_dispatch" || "$EVENT" == "workflow_dispatch" ]]; then
+            if [[ -n "$PR_NUMBER" ]]; then
+              PR_DATA=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq '{head_ref: .head.ref, head_sha: .head.sha, base_ref: .base.ref, base_sha: .base.sha}')
+              echo "head_ref=$(echo "$PR_DATA" | jq -r '.head_ref')" >> "$GITHUB_OUTPUT"
+              echo "head_sha=$(echo "$PR_DATA" | jq -r '.head_sha')" >> "$GITHUB_OUTPUT"
+              echo "base_ref=$(echo "$PR_DATA" | jq -r '.base_ref')" >> "$GITHUB_OUTPUT"
+              echo "base_sha=$(echo "$PR_DATA" | jq -r '.base_sha')" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "head_ref=${{ github.head_ref }}" >> "$GITHUB_OUTPUT"
+            echo "head_sha=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+            echo "base_ref=${{ github.event.pull_request.base.ref }}" >> "$GITHUB_OUTPUT"
+            echo "base_sha=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.context.outputs.head_sha || github.sha }}
+
+      - name: Validate Source Branch
+        id: validate
+        env:
+          HEAD_REF: ${{ steps.context.outputs.head_ref || github.head_ref }}
+          BRANCH_PATTERN: ${{ inputs.branch_pattern }}
+        run: |
+          # For workflow_dispatch without PR, skip branch validation
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -z "$HEAD_REF" ]]; then
+            echo "::notice::Workflow dispatch without PR - skipping branch validation"
+            echo "valid=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Validate branch pattern
+          # shellcheck disable=SC2053
+          if [[ "$HEAD_REF" == $BRANCH_PATTERN ]]; then
+            echo "::notice::Valid source branch: $HEAD_REF"
+            echo "valid=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::PR source branch '$HEAD_REF' does not match expected pattern '$BRANCH_PATTERN'"
+            echo "::warning::Version bumping will be skipped for non-standard branches"
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Detect Changed Artifacts
+        id: detect
+        env:
+          ARTIFACT_PATH: ${{ inputs.artifact_path }}
+          MANIFEST_FILE: ${{ inputs.manifest_file }}
+          BASE_SHA: ${{ steps.context.outputs.base_sha || 'origin/main' }}
+          HEAD_SHA: ${{ steps.context.outputs.head_sha || 'HEAD' }}
+        run: |
+          echo "::group::Detecting changed artifacts"
+
+          ARTIFACTS=$(git diff --name-only "$BASE_SHA..$HEAD_SHA" 2>/dev/null | \
+            grep "^${ARTIFACT_PATH}/" | \
+            cut -d'/' -f2 | \
+            sort -u | \
+            xargs)
+
+          # Filter to valid artifacts
+          VALID=""
+          for artifact in $ARTIFACTS; do
+            if [[ -f "${ARTIFACT_PATH}/${artifact}/${MANIFEST_FILE}" ]]; then
+              VALID="$VALID $artifact"
+            fi
+          done
+          VALID=$(echo "$VALID" | xargs)
+
+          echo "::endgroup::"
+
+          if [[ -z "$VALID" ]]; then
+            echo "::notice::No artifact changes detected"
+            echo "artifact=" >> "$GITHUB_OUTPUT"
+            echo "has_artifact=false" >> "$GITHUB_OUTPUT"
+          else
+            # For atomic PRs, expect exactly one artifact
+            FIRST=$(echo "$VALID" | awk '{print $1}')
+            echo "::notice::Detected artifact: $FIRST"
+            echo "artifact=$FIRST" >> "$GITHUB_OUTPUT"
+            echo "has_artifact=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ==========================================================================
+  # Lint (optional)
+  # ==========================================================================
+  lint:
+    needs: validate-and-detect
+    if: |
+      always() &&
+      needs.validate-and-detect.result == 'success' &&
+      needs.validate-and-detect.outputs.has_artifact == 'true' &&
+      inputs.lint_command != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run lint
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          ARTIFACT_PATH: ${{ inputs.artifact_path }}
+          ARTIFACT: ${{ needs.validate-and-detect.outputs.artifact }}
+        run: |
+          LINT_CMD="${{ inputs.lint_command }}"
+          LINT_CMD=$(eval echo "$LINT_CMD")
+          echo "Running: $LINT_CMD"
+          eval "$LINT_CMD"
+
+  # ==========================================================================
+  # Test (optional)
+  # ==========================================================================
+  test:
+    needs: [validate-and-detect, lint]
+    if: |
+      always() &&
+      needs.validate-and-detect.result == 'success' &&
+      needs.validate-and-detect.outputs.has_artifact == 'true' &&
+      (needs.lint.result == 'success' || needs.lint.result == 'skipped') &&
+      inputs.test_command != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run tests
+        id: test
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          ARTIFACT_PATH: ${{ inputs.artifact_path }}
+          ARTIFACT: ${{ needs.validate-and-detect.outputs.artifact }}
+        run: |
+          TEST_CMD="${{ inputs.test_command }}"
+          TEST_CMD=$(eval echo "$TEST_CMD")
+          echo "Running: $TEST_CMD"
+          eval "$TEST_CMD"
+
+      - name: Generate test digest
+        id: digest
+        if: success()
+        run: |
+          DIGEST=$(echo -n "test-${{ github.sha }}-${{ github.run_id }}" | sha256sum | cut -d' ' -f1)
+          echo "digest=sha256:$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Generate test attestation
+        if: success()
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: "atomic-pr-test"
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          push-to-registry: false
+
+  # ==========================================================================
+  # Version bump and changelog generation
+  # ==========================================================================
+  version-bump:
+    needs: [validate-and-detect, lint, test]
+    if: |
+      always() &&
+      needs.validate-and-detect.outputs.has_artifact == 'true' &&
+      needs.validate-and-detect.outputs.source_valid == 'true' &&
+      (needs.lint.result == 'success' || needs.lint.result == 'skipped') &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped') &&
+      inputs.enable_version_bump
+    runs-on: ubuntu-latest
+    outputs:
+      bumped: ${{ steps.bump.outputs.bumped }}
+      version: ${{ steps.bump.outputs.version }}
+      bump_type: ${{ steps.bump.outputs.bump_type }}
+    steps:
+      - name: Load secrets from 1Password
+        if: inputs.github_app_id_secret_ref != '' && secrets.OP_SERVICE_ACCOUNT_TOKEN != ''
+        id: op-secrets
+        uses: 1password/load-secrets-action@v3
+        with:
+          export-env: false
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          X_REPO_AUTH_APP_ID: ${{ inputs.github_app_id_secret_ref }}
+          X_REPO_AUTH_PRIVATE_KEY: ${{ inputs.github_app_key_secret_ref }}
+
+      - name: Generate GitHub App Token
+        if: steps.op-secrets.outcome == 'success'
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ steps.op-secrets.outputs.X_REPO_AUTH_APP_ID }}
+          private-key: ${{ steps.op-secrets.outputs.X_REPO_AUTH_PRIVATE_KEY }}
+
+      - name: Checkout PR Branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate-and-detect.outputs.head_ref }}
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token || github.token }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Install git-cliff
+        run: |
+          curl -sSL https://github.com/orhun/git-cliff/releases/download/v2.7.0/git-cliff-2.7.0-x86_64-unknown-linux-gnu.tar.gz | tar xz
+          sudo mv git-cliff-2.7.0/git-cliff /usr/local/bin/
+          git-cliff --version
+
+      - name: Bump Version and Generate Changelog
+        id: bump
+        env:
+          ARTIFACT: ${{ needs.validate-and-detect.outputs.artifact }}
+          ARTIFACT_PATH: ${{ inputs.artifact_path }}
+          MANIFEST_FILE: ${{ inputs.manifest_file }}
+          BASE_REF: origin/${{ needs.validate-and-detect.outputs.base_ref }}
+          CLIFF_CONFIG: ${{ inputs.cliff_config }}
+        run: |
+          echo "::group::Processing $ARTIFACT"
+
+          MANIFEST_PATH="${ARTIFACT_PATH}/${ARTIFACT}/${MANIFEST_FILE}"
+          FULL_PATH="${ARTIFACT_PATH}/${ARTIFACT}"
+
+          # Get current version
+          get_version() {
+            case "$MANIFEST_FILE" in
+              Chart.yaml|Chart.yml)
+                grep '^version:' "$MANIFEST_PATH" | awk '{print $2}' | tr -d '"' | tr -d "'"
+                ;;
+              Cargo.toml)
+                grep '^version' "$MANIFEST_PATH" | head -1 | sed 's/.*= *"\([^"]*\)".*/\1/'
+                ;;
+              package.json)
+                jq -r '.version' "$MANIFEST_PATH"
+                ;;
+              *)
+                grep -E '^version[=:]' "$MANIFEST_PATH" | head -1 | sed 's/.*[=:] *"\?\([^"]*\)"\?.*/\1/' | tr -d '"' | tr -d "'" | xargs
+                ;;
+            esac
+          }
+
+          CURRENT_VERSION=$(get_version)
+          BASE_VERSION=$(git show "$BASE_REF:$MANIFEST_PATH" 2>/dev/null | grep -E '^version[=:]' | head -1 | sed 's/.*[=:] *"\?\([^"]*\)"\?.*/\1/' | tr -d '"' | tr -d "'" | xargs || echo "")
+
+          # Check if already bumped
+          if [[ -n "$BASE_VERSION" && "$CURRENT_VERSION" != "$BASE_VERSION" ]]; then
+            echo "::notice::Version already bumped: $BASE_VERSION -> $CURRENT_VERSION"
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+            echo "version=$CURRENT_VERSION" >> "$GITHUB_OUTPUT"
+            echo "bump_type=none" >> "$GITHUB_OUTPUT"
+            echo "::endgroup::"
+            exit 0
+          fi
+
+          # Determine bump type from commits
+          COMMITS=$(git log --oneline "$BASE_REF"..HEAD -- "$FULL_PATH" 2>/dev/null || true)
+          if echo "$COMMITS" | grep -qiE '(BREAKING[ -]CHANGE|!:)'; then
+            BUMP_TYPE="major"
+          elif echo "$COMMITS" | grep -qE '^[a-f0-9]+ feat'; then
+            BUMP_TYPE="minor"
+          else
+            BUMP_TYPE="patch"
+          fi
+
+          echo "::notice::Bump type: $BUMP_TYPE"
+
+          # Calculate next version
+          IFS='.' read -r major minor patch <<< "${CURRENT_VERSION#v}"
+          patch="${patch%%-*}"
+          case "$BUMP_TYPE" in
+            major) NEXT_VERSION="$((major + 1)).0.0" ;;
+            minor) NEXT_VERSION="$major.$((minor + 1)).0" ;;
+            patch) NEXT_VERSION="$major.$minor.$((patch + 1))" ;;
+          esac
+
+          echo "::notice::Version bump: $CURRENT_VERSION -> $NEXT_VERSION"
+
+          # Update manifest
+          case "$MANIFEST_FILE" in
+            Chart.yaml|Chart.yml)
+              sed -i "s/^version: .*/version: $NEXT_VERSION/" "$MANIFEST_PATH"
+              ;;
+            Cargo.toml)
+              sed -i "0,/^version = .*/s//version = \"$NEXT_VERSION\"/" "$MANIFEST_PATH"
+              ;;
+            package.json)
+              tmp=$(mktemp)
+              jq ".version = \"$NEXT_VERSION\"" "$MANIFEST_PATH" > "$tmp"
+              mv "$tmp" "$MANIFEST_PATH"
+              ;;
+            *)
+              sed -i "s/^version[=:] .*/version: $NEXT_VERSION/" "$MANIFEST_PATH"
+              ;;
+          esac
+
+          # Generate changelog
+          CHANGELOG_FILE="${FULL_PATH}/CHANGELOG.md"
+          if [[ ! -f "$CHANGELOG_FILE" ]]; then
+            cat > "$CHANGELOG_FILE" << 'CHANGELOG_EOF'
+          # Changelog
+
+          All notable changes to this project will be documented in this file.
+
+          The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+          and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+          CHANGELOG_EOF
+          fi
+
+          CLIFF_ARGS=""
+          if [[ -f "$CLIFF_CONFIG" ]]; then
+            CLIFF_ARGS="--config $CLIFF_CONFIG"
+          fi
+
+          CHANGELOG_ENTRY=$(git-cliff $CLIFF_ARGS \
+            --include-path "${FULL_PATH}/**" \
+            --unreleased \
+            --tag "${ARTIFACT}-v${NEXT_VERSION}" \
+            --strip header \
+            --strip footer 2>/dev/null || true)
+
+          if [[ -z "$CHANGELOG_ENTRY" ]]; then
+            CHANGELOG_ENTRY="## [$NEXT_VERSION] - $(date +%Y-%m-%d)
+
+          ### Changed
+          $(echo "$COMMITS" | sed 's/^[a-f0-9]* /- /' || echo "- Version bump")
+          "
+          fi
+
+          # Prepend to changelog
+          tmp=$(mktemp)
+          awk -v entry="$CHANGELOG_ENTRY" '
+            /^# Changelog/ { header=1 }
+            header && /^$/ && !inserted { print; print entry; inserted=1; next }
+            { print }
+          ' "$CHANGELOG_FILE" > "$tmp"
+          mv "$tmp" "$CHANGELOG_FILE"
+
+          echo "::notice::Updated CHANGELOG.md"
+
+          echo "bumped=true" >> "$GITHUB_OUTPUT"
+          echo "version=$NEXT_VERSION" >> "$GITHUB_OUTPUT"
+          echo "bump_type=$BUMP_TYPE" >> "$GITHUB_OUTPUT"
+
+          echo "::endgroup::"
+
+      - name: Commit Version Bump
+        if: steps.bump.outputs.bumped == 'true'
+        env:
+          ARTIFACT: ${{ needs.validate-and-detect.outputs.artifact }}
+          ARTIFACT_PATH: ${{ inputs.artifact_path }}
+          MANIFEST_FILE: ${{ inputs.manifest_file }}
+        run: |
+          git add "${ARTIFACT_PATH}/${ARTIFACT}/${MANIFEST_FILE}" "${ARTIFACT_PATH}/${ARTIFACT}/CHANGELOG.md" || true
+
+          if git diff --cached --quiet; then
+            echo "::notice::No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "chore(release): bump ${ARTIFACT} to ${{ steps.bump.outputs.version }}
+
+          Automated version bump based on conventional commits.
+
+          Co-Authored-By: github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+
+          git push origin HEAD:${{ needs.validate-and-detect.outputs.head_ref }}
+          echo "::notice::Committed and pushed version bump"
+
+  # ==========================================================================
+  # Summary
+  # ==========================================================================
+  summary:
+    needs: [validate-and-detect, lint, test, version-bump]
+    if: always() && github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate Summary
+        run: |
+          {
+            echo "## Validate Atomic PR - Summary"
+            echo ""
+            echo "### Validation Results"
+            echo "| Check | Status |"
+            echo "|-------|--------|"
+            echo "| Source Branch Valid | ${{ needs.validate-and-detect.outputs.source_valid == 'true' && ':white_check_mark:' || ':warning:' }} |"
+            echo "| Artifact Detected | ${{ needs.validate-and-detect.outputs.has_artifact == 'true' && ':white_check_mark:' || ':x:' }} |"
+            echo "| Lint | ${{ needs.lint.result == 'success' && ':white_check_mark:' || (needs.lint.result == 'skipped' && ':heavy_minus_sign:' || ':x:') }} |"
+            echo "| Test | ${{ needs.test.result == 'success' && ':white_check_mark:' || (needs.test.result == 'skipped' && ':heavy_minus_sign:' || ':x:') }} |"
+            echo "| Version Bump | ${{ needs.version-bump.result == 'success' && ':white_check_mark:' || (needs.version-bump.result == 'skipped' && ':heavy_minus_sign:' || ':x:') }} |"
+            echo ""
+            if [[ "${{ needs.validate-and-detect.outputs.has_artifact }}" == "true" ]]; then
+              echo "### Artifact"
+              echo "- Name: ${{ needs.validate-and-detect.outputs.artifact }}"
+            fi
+            if [[ "${{ needs.version-bump.outputs.bumped }}" == "true" ]]; then
+              echo "- Version: ${{ needs.version-bump.outputs.version }}"
+              echo "- Bump Type: ${{ needs.version-bump.outputs.bump_type }}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ==========================================================================
+  # Cleanup job (runs only on PR merge)
+  # ==========================================================================
+  cleanup-branch:
+    if: github.event.action == 'closed' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Load secrets from 1Password
+        if: inputs.github_app_id_secret_ref != '' && secrets.OP_SERVICE_ACCOUNT_TOKEN != ''
+        id: op-secrets
+        uses: 1password/load-secrets-action@v3
+        with:
+          export-env: false
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          X_REPO_AUTH_APP_ID: ${{ inputs.github_app_id_secret_ref }}
+          X_REPO_AUTH_PRIVATE_KEY: ${{ inputs.github_app_key_secret_ref }}
+
+      - name: Generate GitHub App Token
+        if: steps.op-secrets.outcome == 'success'
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ steps.op-secrets.outputs.X_REPO_AUTH_APP_ID }}
+          private-key: ${{ steps.op-secrets.outputs.X_REPO_AUTH_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token || github.token }}
+
+      - name: Delete Source Branch
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+        run: |
+          HEAD_REF="${{ github.event.pull_request.head.ref }}"
+          echo "::notice::PR merged, cleaning up branch: $HEAD_REF"
+
+          if git ls-remote --heads origin "$HEAD_REF" | grep -q "$HEAD_REF"; then
+            git push origin --delete "$HEAD_REF"
+            echo "::notice::Deleted branch: $HEAD_REF"
+          else
+            echo "::notice::Branch $HEAD_REF already deleted"
+          fi
+
+  # ==========================================================================
+  # Skip jobs (satisfy required checks when no artifacts change)
+  # ==========================================================================
+  lint-skip:
+    name: lint
+    needs: validate-and-detect
+    if: needs.validate-and-detect.outputs.has_artifact != 'true' && github.event.action != 'closed' && inputs.lint_command != ''
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "No artifact changes detected, skipping lint"
+
+  test-skip:
+    name: test
+    needs: validate-and-detect
+    if: needs.validate-and-detect.outputs.has_artifact != 'true' && github.event.action != 'closed' && inputs.test_command != ''
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "No artifact changes detected, skipping test"

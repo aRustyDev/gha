@@ -1,0 +1,343 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+#
+# Create Release Tags
+#
+# Reusable workflow that creates release tags for changed artifacts
+# when changes are merged to the target branch.
+#
+# This workflow:
+#   1. Detects changed artifacts from the push
+#   2. Reads version from each artifact's manifest
+#   3. Creates annotated git tags in format <artifact>-v<version>
+#   4. Includes attestation lineage in tag message
+#
+# The created tags will trigger the publish-release workflow.
+#
+# Usage:
+#   jobs:
+#     tag:
+#       uses: arustydev/gha/.github/workflows/atomic-release/create-release-tags.yml@v1
+#       with:
+#         artifact_path: "charts"
+#         manifest_file: "Chart.yaml"
+#       secrets:
+#         OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+name: Create Release Tags
+
+on:
+  workflow_call:
+    inputs:
+      artifact_path:
+        description: 'Path to artifacts directory (e.g., "charts", "crates")'
+        required: true
+        type: string
+      manifest_file:
+        description: 'Manifest file name within each artifact'
+        required: true
+        type: string
+      tag_prefix:
+        description: 'Prefix for tags (empty means use artifact name directly)'
+        required: false
+        type: string
+        default: ''
+      github_app_id_secret_ref:
+        description: '1Password reference for GitHub App ID'
+        required: false
+        type: string
+        default: ''
+      github_app_key_secret_ref:
+        description: '1Password reference for GitHub App private key'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      OP_SERVICE_ACCOUNT_TOKEN:
+        required: false
+        description: '1Password service account token for GitHub App credentials'
+    outputs:
+      tags_created:
+        description: 'Comma-separated list of created tags'
+        value: ${{ jobs.create-tags.outputs.tags_created }}
+      artifacts:
+        description: 'Space-separated list of tagged artifacts'
+        value: ${{ jobs.create-tags.outputs.artifacts }}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-tags-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  create-tags:
+    runs-on: ubuntu-latest
+    outputs:
+      tags_created: ${{ steps.create-tags.outputs.tags_created }}
+      artifacts: ${{ steps.detect.outputs.artifacts }}
+    steps:
+      - name: Load secrets from 1Password
+        if: inputs.github_app_id_secret_ref != '' && secrets.OP_SERVICE_ACCOUNT_TOKEN != ''
+        id: op-secrets
+        uses: 1password/load-secrets-action@v3
+        with:
+          export-env: false
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          X_REPO_AUTH_APP_ID: ${{ inputs.github_app_id_secret_ref }}
+          X_REPO_AUTH_PRIVATE_KEY: ${{ inputs.github_app_key_secret_ref }}
+
+      - name: Generate GitHub App Token
+        if: steps.op-secrets.outcome == 'success'
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ steps.op-secrets.outputs.X_REPO_AUTH_APP_ID }}
+          private-key: ${{ steps.op-secrets.outputs.X_REPO_AUTH_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token || github.token }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Detect Changed Artifacts
+        id: detect
+        env:
+          ARTIFACT_PATH: ${{ inputs.artifact_path }}
+          MANIFEST_FILE: ${{ inputs.manifest_file }}
+        run: |
+          RANGE="HEAD~1..HEAD"
+
+          CHANGED_FILES=$(git diff --name-only "$RANGE")
+          ARTIFACTS=""
+
+          for dir in $(echo "$CHANGED_FILES" | grep "^${ARTIFACT_PATH}/" | cut -d'/' -f2 | sort -u); do
+            if [[ -f "${ARTIFACT_PATH}/${dir}/${MANIFEST_FILE}" ]]; then
+              ARTIFACTS="$ARTIFACTS $dir"
+            fi
+          done
+
+          ARTIFACTS=$(echo "$ARTIFACTS" | xargs)
+
+          if [[ -z "$ARTIFACTS" ]]; then
+            echo "::notice::No artifact changes detected, skipping tagging"
+            echo "artifacts=" >> "$GITHUB_OUTPUT"
+            echo "has_artifacts=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "artifacts=$ARTIFACTS" >> "$GITHUB_OUTPUT"
+          echo "has_artifacts=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::Artifacts to tag: $ARTIFACTS"
+
+      - name: Find Source PR
+        id: source-pr
+        if: steps.detect.outputs.has_artifacts == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Try to find source PR from commit message
+          pr_number=$(git log -1 --format="%s" HEAD | grep -oE '#[0-9]+' | head -1 | tr -d '#')
+
+          if [[ -z "$pr_number" ]]; then
+            pr_number=$(gh api "/repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" --jq '.[0].number' 2>/dev/null || true)
+          fi
+
+          if [[ -z "$pr_number" || "$pr_number" == "null" ]]; then
+            echo "::warning::Could not find source PR for commit ${{ github.sha }}"
+            echo "pr_number=" >> "$GITHUB_OUTPUT"
+            echo "attestation_map={}" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Source PR: #$pr_number"
+            echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+
+            # Extract attestation map from source PR
+            body=$(gh pr view "$pr_number" --json body -q '.body' 2>/dev/null || echo "")
+            attestation_map=$(echo "$body" | awk '
+              /<!-- ATTESTATION_MAP/,/-->/ {
+                if (!/<!-- ATTESTATION_MAP/ && !/-->/) print
+              }
+            ' | tr -d '\n' | xargs)
+
+            if [[ -z "$attestation_map" ]]; then
+              attestation_map='{}'
+            fi
+
+            echo "attestation_map=$attestation_map" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Tags
+        id: create-tags
+        if: steps.detect.outputs.has_artifacts == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          ARTIFACT_PATH: ${{ inputs.artifact_path }}
+          MANIFEST_FILE: ${{ inputs.manifest_file }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+          ARTIFACTS: ${{ steps.detect.outputs.artifacts }}
+          PR_NUMBER: ${{ steps.source-pr.outputs.pr_number }}
+          ATTESTATION_MAP: ${{ steps.source-pr.outputs.attestation_map }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          CREATED_TAGS=""
+          SKIPPED=""
+          FAILED=false
+
+          for artifact in $ARTIFACTS; do
+            echo "::group::Processing $artifact"
+
+            MANIFEST_PATH="${ARTIFACT_PATH}/${artifact}/${MANIFEST_FILE}"
+            if [[ ! -f "$MANIFEST_PATH" ]]; then
+              echo "::warning::Manifest not found for $artifact, skipping"
+              echo "::endgroup::"
+              continue
+            fi
+
+            # Extract version based on manifest type
+            case "$MANIFEST_FILE" in
+              Chart.yaml|Chart.yml)
+                VERSION=$(grep '^version:' "$MANIFEST_PATH" | awk '{print $2}' | tr -d '"' | tr -d "'")
+                ;;
+              Cargo.toml)
+                VERSION=$(grep '^version' "$MANIFEST_PATH" | head -1 | sed 's/.*= *"\([^"]*\)".*/\1/')
+                ;;
+              package.json)
+                VERSION=$(jq -r '.version' "$MANIFEST_PATH")
+                ;;
+              *)
+                VERSION=$(grep -E '^version[=:]' "$MANIFEST_PATH" | head -1 | sed 's/.*[=:] *"\?\([^"]*\)"\?.*/\1/' | tr -d '"' | tr -d "'" | xargs)
+                ;;
+            esac
+
+            if [[ -z "$VERSION" ]]; then
+              echo "::error::Could not extract version from $MANIFEST_PATH"
+              FAILED=true
+              echo "::endgroup::"
+              continue
+            fi
+
+            # Build tag name
+            if [[ -n "$TAG_PREFIX" ]]; then
+              TAG_NAME="${TAG_PREFIX}/${artifact}-v${VERSION}"
+            else
+              TAG_NAME="${artifact}-v${VERSION}"
+            fi
+
+            echo "Tag: $TAG_NAME, Version: $VERSION"
+
+            # Check if tag already exists
+            if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+              EXISTING_COMMIT=$(git rev-list -n 1 "$TAG_NAME")
+              if [[ "$EXISTING_COMMIT" == "$COMMIT_SHA" ]]; then
+                echo "::notice::Tag $TAG_NAME already exists at this commit, skipping"
+                SKIPPED="${SKIPPED} ${TAG_NAME}"
+                echo "::endgroup::"
+                continue
+              else
+                echo "::error::Tag $TAG_NAME exists but points to different commit!"
+                echo "::error::This indicates version was not bumped properly."
+                FAILED=true
+                echo "::endgroup::"
+                continue
+              fi
+            fi
+
+            # Extract changelog for this version
+            CHANGELOG_FILE="${ARTIFACT_PATH}/${artifact}/CHANGELOG.md"
+            if [[ -f "$CHANGELOG_FILE" ]]; then
+              CHANGELOG=$(awk -v ver="$VERSION" '
+                /^## \[/ { if (found) exit; if ($0 ~ "\\[" ver "\\]") found=1 }
+                found { print }
+              ' "$CHANGELOG_FILE")
+            else
+              CHANGELOG="No changelog available"
+            fi
+
+            # Format attestation lineage
+            if [[ -n "$ATTESTATION_MAP" && "$ATTESTATION_MAP" != "{}" ]]; then
+              ATTESTATION_LINEAGE=$(echo "$ATTESTATION_MAP" | jq -r 'to_entries | .[] | "- \(.key): \(.value)"' 2>/dev/null || echo "- Parse error")
+            else
+              ATTESTATION_LINEAGE="- No attestation data available"
+            fi
+
+            # Create annotated tag
+            git tag -a "$TAG_NAME" -m "$(cat <<TAG_MSG
+          Release: $artifact v$VERSION
+
+          Attestation Lineage:
+          $ATTESTATION_LINEAGE
+
+          Changelog:
+          $CHANGELOG
+
+          Source PR: #${PR_NUMBER:-unknown}
+          Commit: $COMMIT_SHA
+          TAG_MSG
+          )"
+
+            git push origin "$TAG_NAME"
+            echo "::notice::Created and pushed tag: $TAG_NAME"
+
+            if [[ -z "$CREATED_TAGS" ]]; then
+              CREATED_TAGS="$TAG_NAME"
+            else
+              CREATED_TAGS="${CREATED_TAGS},${TAG_NAME}"
+            fi
+
+            echo "::endgroup::"
+          done
+
+          echo "tags_created=$CREATED_TAGS" >> "$GITHUB_OUTPUT"
+          echo "skipped=$SKIPPED" >> "$GITHUB_OUTPUT"
+
+          if [[ "$FAILED" == "true" ]]; then
+            echo "::error::One or more tags failed to create"
+            exit 1
+          fi
+
+          if [[ -n "$CREATED_TAGS" ]]; then
+            echo "::notice::Tags created: $CREATED_TAGS"
+            echo "::notice::Release workflow will trigger for each tag"
+          fi
+
+  summary:
+    needs: create-tags
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate Summary
+        run: |
+          {
+            echo "## Create Release Tags - Summary"
+            echo ""
+            echo "### Commit"
+            echo "- SHA: ${{ github.sha }}"
+            echo "- Message: ${{ github.event.head_commit.message }}"
+            echo ""
+            echo "### Results"
+            echo "| Phase | Status |"
+            echo "|-------|--------|"
+            echo "| Create Tags | ${{ needs.create-tags.result == 'success' && ':white_check_mark:' || ':x:' }} |"
+            echo ""
+            if [[ -n "${{ needs.create-tags.outputs.tags_created }}" ]]; then
+              echo "### Tags Created"
+              echo "\`\`\`"
+              echo "${{ needs.create-tags.outputs.tags_created }}" | tr ',' '\n'
+              echo "\`\`\`"
+              echo ""
+              echo "> These tags will trigger the Publish Release workflow."
+            elif [[ -n "${{ needs.create-tags.outputs.artifacts }}" ]]; then
+              echo "### No Tags Created"
+              echo "Artifacts detected: ${{ needs.create-tags.outputs.artifacts }}"
+              echo "Tags may have been skipped (already exist) or failed to create."
+            else
+              echo "No artifact changes detected in this push."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

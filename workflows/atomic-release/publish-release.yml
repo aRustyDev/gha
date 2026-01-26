@@ -1,0 +1,504 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+#
+# Publish Release
+#
+# Reusable workflow that packages, signs, and publishes releases.
+# Triggered when release tags are pushed (<artifact>-v<version>).
+#
+# This workflow:
+#   1. Validates tag format matches expected pattern
+#   2. Validates artifact directory exists
+#   3. Validates manifest version matches tag version
+#   4. Runs custom build/package command
+#   5. Generates build attestations
+#   6. Publishes to configured registry (OCI, npm, crates.io, etc.)
+#   7. Signs with Cosign (optional)
+#   8. Creates GitHub Release with artifacts and signatures
+#
+# Usage:
+#   jobs:
+#     release:
+#       uses: arustydev/gha/.github/workflows/atomic-release/publish-release.yml@v1
+#       with:
+#         artifact_path: "charts"
+#         manifest_file: "Chart.yaml"
+#         tag_pattern: "*-v*"
+#         build_command: "helm package charts/$ARTIFACT -d .release-packages/"
+#         publish_command: "helm push .release-packages/$ARTIFACT-$VERSION.tgz oci://ghcr.io/$REPO"
+#       secrets:
+#         OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+name: Publish Release
+
+on:
+  workflow_call:
+    inputs:
+      artifact_path:
+        description: 'Path to artifacts directory (e.g., "charts", "crates")'
+        required: true
+        type: string
+      manifest_file:
+        description: 'Manifest file name within each artifact'
+        required: true
+        type: string
+      tag_pattern:
+        description: 'Glob pattern for release tags (e.g., "*-v*")'
+        required: false
+        type: string
+        default: '*-v*'
+      build_command:
+        description: 'Build/package command. Variables: $ARTIFACT, $VERSION, $ARTIFACT_PATH'
+        required: true
+        type: string
+      publish_command:
+        description: 'Publish command. Variables: $ARTIFACT, $VERSION, $ARTIFACT_PATH, $PACKAGE, $REPO'
+        required: false
+        type: string
+        default: ''
+      package_glob:
+        description: 'Glob pattern for built packages (e.g., ".release-packages/*.tgz")'
+        required: false
+        type: string
+        default: '.release-packages/*'
+      enable_cosign:
+        description: 'Sign artifacts with Cosign'
+        required: false
+        type: boolean
+        default: true
+      create_github_release:
+        description: 'Create GitHub Release with artifacts'
+        required: false
+        type: boolean
+        default: true
+      github_app_id_secret_ref:
+        description: '1Password reference for GitHub App ID'
+        required: false
+        type: string
+        default: ''
+      github_app_key_secret_ref:
+        description: '1Password reference for GitHub App private key'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      OP_SERVICE_ACCOUNT_TOKEN:
+        required: false
+        description: '1Password service account token'
+    outputs:
+      artifact:
+        description: 'Released artifact name'
+        value: ${{ jobs.validate-tag.outputs.artifact }}
+      version:
+        description: 'Released version'
+        value: ${{ jobs.validate-tag.outputs.version }}
+      release_url:
+        description: 'GitHub Release URL'
+        value: ${{ jobs.publish-release.outputs.release_url }}
+
+permissions:
+  contents: write
+  packages: write
+  pull-requests: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: publish-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  # ==========================================================================
+  # Phase 1: Validate tag and extract artifact info
+  # ==========================================================================
+  validate-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      artifact: ${{ steps.parse.outputs.artifact }}
+      version: ${{ steps.parse.outputs.version }}
+      tag: ${{ steps.parse.outputs.tag }}
+      valid: ${{ steps.validate.outputs.valid }}
+    steps:
+      - name: Parse Tag
+        id: parse
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          echo "::notice::Processing tag: $TAG"
+
+          # Validate tag format: <artifact>-v<version>
+          # Artifact names can contain hyphens, so we match from the right
+          if [[ ! "$TAG" =~ ^(.+)-v([0-9]+\.[0-9]+\.[0-9]+.*)$ ]]; then
+            echo "::error::Invalid tag format: $TAG"
+            echo "::error::Expected format: <artifact>-v<version> (e.g., my-artifact-v0.1.0)"
+            exit 1
+          fi
+
+          ARTIFACT="${BASH_REMATCH[1]}"
+          VERSION="${BASH_REMATCH[2]}"
+
+          echo "artifact=$ARTIFACT" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          echo "::notice::Artifact: $ARTIFACT"
+          echo "::notice::Version: $VERSION"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.parse.outputs.tag }}
+
+      - name: Validate Artifact Exists
+        id: validate
+        env:
+          ARTIFACT: ${{ steps.parse.outputs.artifact }}
+          VERSION: ${{ steps.parse.outputs.version }}
+          ARTIFACT_PATH: ${{ inputs.artifact_path }}
+          MANIFEST_FILE: ${{ inputs.manifest_file }}
+        run: |
+          ARTIFACT_DIR="${ARTIFACT_PATH}/${ARTIFACT}"
+          MANIFEST_PATH="${ARTIFACT_DIR}/${MANIFEST_FILE}"
+
+          echo "::group::Validating artifact: $ARTIFACT"
+
+          # Check artifact directory exists
+          if [[ ! -d "$ARTIFACT_DIR" ]]; then
+            echo "::error::Artifact directory not found: $ARTIFACT_DIR"
+            echo "::error::Tag '${{ steps.parse.outputs.tag }}' does not match any artifact"
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          # Check manifest exists
+          if [[ ! -f "$MANIFEST_PATH" ]]; then
+            echo "::error::Manifest not found: $MANIFEST_PATH"
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          # Extract version from manifest
+          case "$MANIFEST_FILE" in
+            Chart.yaml|Chart.yml)
+              MANIFEST_VERSION=$(grep '^version:' "$MANIFEST_PATH" | awk '{print $2}' | tr -d '"' | tr -d "'")
+              ;;
+            Cargo.toml)
+              MANIFEST_VERSION=$(grep '^version' "$MANIFEST_PATH" | head -1 | sed 's/.*= *"\([^"]*\)".*/\1/')
+              ;;
+            package.json)
+              MANIFEST_VERSION=$(jq -r '.version' "$MANIFEST_PATH")
+              ;;
+            *)
+              MANIFEST_VERSION=$(grep -E '^version[=:]' "$MANIFEST_PATH" | head -1 | sed 's/.*[=:] *"\?\([^"]*\)"\?.*/\1/' | tr -d '"' | tr -d "'" | xargs)
+              ;;
+          esac
+
+          if [[ -z "$MANIFEST_VERSION" ]]; then
+            echo "::error::Could not extract version from $MANIFEST_PATH"
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          if [[ "$MANIFEST_VERSION" != "$VERSION" ]]; then
+            echo "::error::Version mismatch!"
+            echo "::error::Tag version: $VERSION"
+            echo "::error::Manifest version: $MANIFEST_VERSION"
+            echo "::error::Tag and manifest versions must match"
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          echo "::notice::Artifact validated successfully"
+          echo "::notice::  Directory: $ARTIFACT_DIR"
+          echo "::notice::  Version: $VERSION"
+          echo "valid=true" >> "$GITHUB_OUTPUT"
+
+          echo "::endgroup::"
+
+  # ==========================================================================
+  # Phase 2: Build package and generate attestations
+  # ==========================================================================
+  build-package:
+    needs: validate-tag
+    if: needs.validate-tag.outputs.valid == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      package: ${{ steps.build.outputs.package }}
+      package_name: ${{ steps.build.outputs.package_name }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout Tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate-tag.outputs.tag }}
+
+      - name: Build Package
+        id: build
+        env:
+          ARTIFACT: ${{ needs.validate-tag.outputs.artifact }}
+          VERSION: ${{ needs.validate-tag.outputs.version }}
+          ARTIFACT_PATH: ${{ inputs.artifact_path }}
+          PACKAGE_GLOB: ${{ inputs.package_glob }}
+        run: |
+          echo "::group::Building package"
+
+          # Create output directory
+          mkdir -p .release-packages
+
+          # Run build command
+          BUILD_CMD="${{ inputs.build_command }}"
+          BUILD_CMD=$(eval echo "$BUILD_CMD")
+          echo "Running: $BUILD_CMD"
+          eval "$BUILD_CMD"
+
+          echo "::endgroup::"
+
+          # Find the built package
+          PACKAGE=$(ls -1 $PACKAGE_GLOB 2>/dev/null | head -1)
+
+          if [[ -z "$PACKAGE" || ! -f "$PACKAGE" ]]; then
+            echo "::error::No package found matching: $PACKAGE_GLOB"
+            ls -la .release-packages/ || true
+            exit 1
+          fi
+
+          PACKAGE_NAME=$(basename "$PACKAGE")
+          DIGEST=$(sha256sum "$PACKAGE" | cut -d' ' -f1)
+
+          echo "package=$PACKAGE" >> "$GITHUB_OUTPUT"
+          echo "package_name=$PACKAGE_NAME" >> "$GITHUB_OUTPUT"
+          echo "digest=sha256:$DIGEST" >> "$GITHUB_OUTPUT"
+
+          echo "::notice::Package: $PACKAGE_NAME"
+          echo "::notice::Digest: sha256:$DIGEST"
+
+      - name: Generate Build Attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.build.outputs.package }}
+
+      - name: Upload Package Artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-package-${{ needs.validate-tag.outputs.artifact }}-${{ needs.validate-tag.outputs.version }}
+          path: ${{ steps.build.outputs.package }}
+          retention-days: 7
+
+  # ==========================================================================
+  # Phase 3: Publish to registry and create release
+  # ==========================================================================
+  publish-release:
+    needs: [validate-tag, build-package]
+    if: needs.validate-tag.outputs.valid == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      release_url: ${{ steps.create-release.outputs.release_url }}
+    steps:
+      - name: Download Package
+        uses: actions/download-artifact@v7
+        with:
+          name: release-package-${{ needs.validate-tag.outputs.artifact }}-${{ needs.validate-tag.outputs.version }}
+          path: .release-packages/
+
+      - name: Verify Package
+        id: verify
+        env:
+          ARTIFACT: ${{ needs.validate-tag.outputs.artifact }}
+          VERSION: ${{ needs.validate-tag.outputs.version }}
+        run: |
+          PACKAGE=$(ls -1 .release-packages/* | head -1)
+
+          if [[ ! -f "$PACKAGE" ]]; then
+            echo "::error::Package not found"
+            ls -la .release-packages/
+            exit 1
+          fi
+
+          DIGEST=$(sha256sum "$PACKAGE" | cut -d' ' -f1)
+
+          echo "package=$PACKAGE" >> "$GITHUB_OUTPUT"
+          echo "package_name=$(basename "$PACKAGE")" >> "$GITHUB_OUTPUT"
+          echo "digest=sha256:$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Load secrets from 1Password
+        if: inputs.github_app_id_secret_ref != '' && secrets.OP_SERVICE_ACCOUNT_TOKEN != ''
+        id: op-secrets
+        uses: 1password/load-secrets-action@v3
+        with:
+          export-env: false
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          X_REPO_AUTH_APP_ID: ${{ inputs.github_app_id_secret_ref }}
+          X_REPO_AUTH_PRIVATE_KEY: ${{ inputs.github_app_key_secret_ref }}
+
+      - name: Generate GitHub App Token
+        if: steps.op-secrets.outcome == 'success'
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ steps.op-secrets.outputs.X_REPO_AUTH_APP_ID }}
+          private-key: ${{ steps.op-secrets.outputs.X_REPO_AUTH_PRIVATE_KEY }}
+
+      - name: Install Cosign
+        if: inputs.enable_cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Login to GHCR
+        if: inputs.publish_command != ''
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish to Registry
+        id: publish
+        if: inputs.publish_command != ''
+        env:
+          ARTIFACT: ${{ needs.validate-tag.outputs.artifact }}
+          VERSION: ${{ needs.validate-tag.outputs.version }}
+          ARTIFACT_PATH: ${{ inputs.artifact_path }}
+          PACKAGE: ${{ steps.verify.outputs.package }}
+          REPO: ${{ github.repository }}
+        run: |
+          PUBLISH_CMD="${{ inputs.publish_command }}"
+          PUBLISH_CMD=$(eval echo "$PUBLISH_CMD")
+
+          MAX_RETRIES=3
+          RETRY_DELAY=5
+
+          for ((attempt=1; attempt<=MAX_RETRIES; attempt++)); do
+            echo "::group::Publish attempt $attempt/$MAX_RETRIES"
+            echo "Running: $PUBLISH_CMD"
+
+            if PUBLISH_OUTPUT=$(eval "$PUBLISH_CMD" 2>&1); then
+              echo "$PUBLISH_OUTPUT"
+              echo "::notice::Published $ARTIFACT:$VERSION"
+              echo "::endgroup::"
+              echo "published=true" >> "$GITHUB_OUTPUT"
+              break
+            fi
+
+            echo "::warning::Attempt $attempt failed"
+            echo "$PUBLISH_OUTPUT"
+            echo "::endgroup::"
+
+            if [[ $attempt -lt $MAX_RETRIES ]]; then
+              sleep $RETRY_DELAY
+              RETRY_DELAY=$((RETRY_DELAY * 2))
+            else
+              echo "::error::Failed to publish after $MAX_RETRIES attempts"
+              exit 1
+            fi
+          done
+
+      - name: Sign with Cosign
+        if: inputs.enable_cosign && steps.publish.outputs.published == 'true'
+        env:
+          PACKAGE: ${{ steps.verify.outputs.package }}
+        run: |
+          echo "::group::Signing with Cosign"
+          cosign sign-blob --yes --output-signature "${PACKAGE}.sig" "$PACKAGE"
+          echo "::notice::Signed package"
+          echo "::endgroup::"
+
+      - name: Create GitHub Release
+        id: create-release
+        if: inputs.create_github_release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          ARTIFACT: ${{ needs.validate-tag.outputs.artifact }}
+          VERSION: ${{ needs.validate-tag.outputs.version }}
+          TAG: ${{ needs.validate-tag.outputs.tag }}
+          PACKAGE: ${{ steps.verify.outputs.package }}
+          DIGEST: ${{ steps.verify.outputs.digest }}
+        run: |
+          # Check if release exists
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "::notice::Release $TAG already exists"
+            RELEASE_URL=$(gh release view "$TAG" --repo "${{ github.repository }}" --json url -q '.url')
+            echo "release_url=$RELEASE_URL" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Create attestation lineage file
+          cat > "${ARTIFACT}-attestation-lineage.json" <<LINEAGE_EOF
+          {
+            "artifact": "$ARTIFACT",
+            "version": "$VERSION",
+            "tag": "$TAG",
+            "package_digest": "$DIGEST",
+            "published_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "workflow_run_id": "${{ github.run_id }}",
+            "commit": "${{ github.sha }}"
+          }
+          LINEAGE_EOF
+
+          # Collect release assets
+          ASSETS=("$PACKAGE" "${ARTIFACT}-attestation-lineage.json")
+
+          if [[ -f "${PACKAGE}.sig" ]]; then
+            ASSETS+=("${PACKAGE}.sig")
+          fi
+
+          # Generate release notes
+          RELEASE_NOTES=$(cat <<NOTES_EOF
+          ## $ARTIFACT v$VERSION
+
+          ### Installation
+
+          See the project documentation for installation instructions.
+
+          ### Checksums
+
+          | File | SHA256 |
+          |------|--------|
+          | \`$(basename "$PACKAGE")\` | \`${DIGEST#sha256:}\` |
+
+          ---
+          *Released by Atomic Release Pipeline*
+          NOTES_EOF
+          )
+
+          # Create release
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "$ARTIFACT v$VERSION" \
+            --notes "$RELEASE_NOTES" \
+            "${ASSETS[@]}"
+
+          RELEASE_URL=$(gh release view "$TAG" --repo "${{ github.repository }}" --json url -q '.url')
+          echo "::notice::Created release: $RELEASE_URL"
+          echo "release_url=$RELEASE_URL" >> "$GITHUB_OUTPUT"
+
+  # ==========================================================================
+  # Summary
+  # ==========================================================================
+  summary:
+    needs: [validate-tag, build-package, publish-release]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate Summary
+        run: |
+          {
+            echo "## Publish Release - Summary"
+            echo ""
+            echo "### Tag Information"
+            echo "- **Tag**: ${{ needs.validate-tag.outputs.tag }}"
+            echo "- **Artifact**: ${{ needs.validate-tag.outputs.artifact }}"
+            echo "- **Version**: ${{ needs.validate-tag.outputs.version }}"
+            echo ""
+            echo "### Results"
+            echo "| Phase | Status |"
+            echo "|-------|--------|"
+            echo "| Validate Tag | ${{ needs.validate-tag.result == 'success' && ':white_check_mark:' || ':x:' }} |"
+            echo "| Build Package | ${{ needs.build-package.result == 'success' && ':white_check_mark:' || (needs.build-package.result == 'skipped' && ':heavy_minus_sign:' || ':x:') }} |"
+            echo "| Publish Release | ${{ needs.publish-release.result == 'success' && ':white_check_mark:' || (needs.publish-release.result == 'skipped' && ':heavy_minus_sign:' || ':x:') }} |"
+            echo ""
+            if [[ "${{ needs.validate-tag.outputs.valid }}" == "true" && -n "${{ needs.publish-release.outputs.release_url }}" ]]; then
+              echo "### Distribution"
+              echo "- **GitHub Release**: [${{ needs.validate-tag.outputs.tag }}](${{ needs.publish-release.outputs.release_url }})"
+            elif [[ "${{ needs.validate-tag.outputs.valid }}" != "true" ]]; then
+              echo "### Validation Failed"
+              echo "The tag did not pass validation. Check the logs for details."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

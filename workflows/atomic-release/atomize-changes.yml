@@ -1,0 +1,509 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+#
+# Atomize Changes
+#
+# Reusable workflow that detects changes and creates atomic branches
+# for processing with PRs to the target branch.
+#
+# For each changed artifact, this workflow:
+#   1. Creates/updates a dedicated branch (e.g., charts/<artifact>)
+#   2. Creates/updates a PR to the target branch
+#   3. Passes through attestation lineage from source PR
+#
+# Usage:
+#   jobs:
+#     atomize:
+#       uses: arustydev/gha/.github/workflows/atomic-release/atomize-changes.yml@v1
+#       with:
+#         artifact_path: "charts"
+#         manifest_file: "Chart.yaml"
+#         branch_prefix: "charts"
+#         target_branch: "main"
+#         source_branch: "integration"
+#       secrets: inherit
+
+name: Atomize Changes
+
+on:
+  workflow_call:
+    inputs:
+      artifact_path:
+        description: 'Path to artifacts directory (e.g., "charts", "crates")'
+        required: true
+        type: string
+      manifest_file:
+        description: 'Manifest file name within each artifact (e.g., "Chart.yaml", "Cargo.toml")'
+        required: true
+        type: string
+      branch_prefix:
+        description: 'Prefix for atomic branches (e.g., "charts" -> "charts/<artifact>")'
+        required: false
+        type: string
+        default: ''
+      target_branch:
+        description: 'Target branch for PRs (usually "main")'
+        required: false
+        type: string
+        default: 'main'
+      source_branch:
+        description: 'Source branch (for commit range detection)'
+        required: false
+        type: string
+        default: 'integration'
+      trigger_validation:
+        description: 'Dispatch event type to trigger validation workflow'
+        required: false
+        type: string
+        default: ''
+      dry_run:
+        description: 'Dry run (no PR creation)'
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      artifacts:
+        description: 'JSON array of processed artifacts'
+        value: ${{ jobs.detect-changes.outputs.artifacts_json }}
+      artifacts_count:
+        description: 'Number of artifacts processed'
+        value: ${{ jobs.detect-changes.outputs.artifacts_count }}
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: atomize-${{ inputs.artifact_path }}-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  #############################################################################
+  # Detect Changes and Source PR
+  #############################################################################
+  detect-changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      artifacts: ${{ steps.detect.outputs.artifacts }}
+      artifacts_json: ${{ steps.detect.outputs.artifacts_json }}
+      artifacts_count: ${{ steps.detect.outputs.artifacts_count }}
+      source_pr: ${{ steps.source.outputs.pr_number }}
+      attestation_map: ${{ steps.source.outputs.attestation_map }}
+      is_dependabot: ${{ steps.source.outputs.is_dependabot }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed artifacts
+        id: detect
+        env:
+          ARTIFACT_PATH: ${{ inputs.artifact_path }}
+          MANIFEST_FILE: ${{ inputs.manifest_file }}
+        run: |
+          # Handle both squash merges and merge commits
+          if git rev-parse HEAD^2 >/dev/null 2>&1; then
+            RANGE="HEAD^..HEAD"
+            echo "::notice::Detected merge commit, using range: $RANGE"
+          else
+            RANGE="HEAD~1..HEAD"
+            echo "::notice::Detected squash/regular commit, using range: $RANGE"
+          fi
+
+          # Get all changed files
+          CHANGED_FILES=$(git diff --name-only "$RANGE")
+
+          # Detect artifact changes
+          ARTIFACTS=""
+          for dir in $(echo "$CHANGED_FILES" | grep "^${ARTIFACT_PATH}/" | cut -d'/' -f2 | sort -u); do
+            if [[ -f "${ARTIFACT_PATH}/${dir}/${MANIFEST_FILE}" ]]; then
+              ARTIFACTS="$ARTIFACTS $dir"
+            else
+              echo "::notice::Skipping $dir - no $MANIFEST_FILE found"
+            fi
+          done
+
+          ARTIFACTS=$(echo "$ARTIFACTS" | xargs)
+          ARTIFACTS_COUNT=$(echo "$ARTIFACTS" | wc -w | xargs)
+
+          if [[ -z "$ARTIFACTS" ]]; then
+            echo "::notice::No artifact changes detected"
+            echo "artifacts=" >> "$GITHUB_OUTPUT"
+            echo "artifacts_json=[]" >> "$GITHUB_OUTPUT"
+            echo "artifacts_count=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Changed artifacts: $ARTIFACTS"
+            echo "artifacts=$ARTIFACTS" >> "$GITHUB_OUTPUT"
+
+            # Convert to JSON array for matrix
+            ARTIFACTS_JSON=$(echo "$ARTIFACTS" | tr ' ' '\n' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            echo "artifacts_json=$ARTIFACTS_JSON" >> "$GITHUB_OUTPUT"
+            echo "artifacts_count=$ARTIFACTS_COUNT" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Find source PR
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Try to find the source PR from merge commit message
+          pr_number=$(git log -1 --format="%s" HEAD | grep -oE '#[0-9]+' | head -1 | tr -d '#')
+
+          if [[ -z "$pr_number" ]]; then
+            # Try GitHub API as fallback
+            pr_number=$(gh api "/repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" --jq '.[0].number' 2>/dev/null || true)
+          fi
+
+          if [[ -z "$pr_number" || "$pr_number" == "null" ]]; then
+            echo "::warning::Could not find source PR for commit"
+            echo "pr_number=" >> "$GITHUB_OUTPUT"
+            echo "attestation_map={}" >> "$GITHUB_OUTPUT"
+            echo "is_dependabot=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Source PR: #$pr_number"
+            echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+
+            # Check if source PR is from dependabot
+            PR_AUTHOR=$(gh pr view "$pr_number" --json author --jq '.author.login')
+            if [[ "$PR_AUTHOR" == "dependabot[bot]" ]]; then
+              echo "::notice::Source PR is from dependabot"
+              echo "is_dependabot=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "is_dependabot=false" >> "$GITHUB_OUTPUT"
+            fi
+
+            # Extract attestation map from source PR
+            body=$(gh pr view "$pr_number" --json body -q '.body' 2>/dev/null || echo "")
+            attestation_map=$(echo "$body" | awk '
+              /<!-- ATTESTATION_MAP/,/-->/ {
+                if (!/<!-- ATTESTATION_MAP/ && !/-->/) print
+              }
+            ' | tr -d '\n' | xargs)
+
+            if [[ -z "$attestation_map" ]]; then
+              attestation_map='{}'
+            fi
+
+            if [[ "$attestation_map" == "{}" ]]; then
+              echo "::warning::Source PR #$pr_number has no attestation map"
+            else
+              ENTRY_COUNT=$(echo "$attestation_map" | jq 'keys | length')
+              echo "::notice::Found attestation map with $ENTRY_COUNT entries"
+            fi
+
+            echo "attestation_map=$attestation_map" >> "$GITHUB_OUTPUT"
+          fi
+
+  #############################################################################
+  # Process Each Artifact (Branch + PR)
+  #############################################################################
+  process-artifacts:
+    name: Process ${{ matrix.artifact }}
+    needs: detect-changes
+    if: needs.detect-changes.outputs.artifacts_count != '0' && !inputs.dry_run
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        artifact: ${{ fromJson(needs.detect-changes.outputs.artifacts_json) }}
+      fail-fast: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create/update artifact branch
+        id: branch
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          ARTIFACT_PATH: ${{ inputs.artifact_path }}
+          BRANCH_PREFIX: ${{ inputs.branch_prefix }}
+          SOURCE_PR: ${{ needs.detect-changes.outputs.source_pr }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          set -e
+
+          # Determine branch name
+          if [[ -n "$BRANCH_PREFIX" ]]; then
+            BRANCH="${BRANCH_PREFIX}/${ARTIFACT}"
+          else
+            BRANCH="${ARTIFACT_PATH}/${ARTIFACT}"
+          fi
+
+          echo "::group::Branch operations for $ARTIFACT"
+
+          # Check if branch exists remotely
+          if git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
+            echo "::notice::Branch $BRANCH exists, fetching..."
+            git fetch origin "$BRANCH"
+
+            # Check if we need to update
+            LOCAL_SHA=$(git rev-parse "HEAD:${ARTIFACT_PATH}/${ARTIFACT}" 2>/dev/null || echo "none")
+            REMOTE_SHA=$(git rev-parse "origin/${BRANCH}:${ARTIFACT_PATH}/${ARTIFACT}" 2>/dev/null || echo "none")
+
+            if [[ "$LOCAL_SHA" == "$REMOTE_SHA" ]]; then
+              echo "::notice::No changes to push for $ARTIFACT (already up to date)"
+              echo "updated=false" >> "$GITHUB_OUTPUT"
+              echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+              echo "::endgroup::"
+              exit 0
+            fi
+
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+          else
+            echo "::notice::Creating new branch: $BRANCH from origin/$TARGET_BRANCH"
+            git checkout -b "$BRANCH" "origin/$TARGET_BRANCH"
+          fi
+
+          # Copy the artifact directory from the source commit
+          git checkout "${{ github.sha }}" -- "${ARTIFACT_PATH}/${ARTIFACT}/"
+
+          # Check if there are changes to commit
+          if git diff --cached --quiet && git diff --quiet; then
+            echo "::notice::No changes to commit for $ARTIFACT"
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+            echo "::endgroup::"
+            exit 0
+          fi
+
+          # Stage and commit
+          git add "${ARTIFACT_PATH}/${ARTIFACT}/"
+
+          COMMIT_MSG="chore(${ARTIFACT}): sync from ${{ inputs.source_branch }}"
+          if [[ -n "$SOURCE_PR" ]]; then
+            COMMIT_MSG="${COMMIT_MSG}"$'\n\n'"Source-PR: #${SOURCE_PR}"
+          fi
+
+          git commit -m "$COMMIT_MSG"
+
+          # Push with retry logic
+          MAX_RETRIES=3
+          for ((i=1; i<=MAX_RETRIES; i++)); do
+            if git push origin "$BRANCH" --force-with-lease; then
+              echo "::notice::Successfully pushed $BRANCH"
+              echo "updated=true" >> "$GITHUB_OUTPUT"
+              echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+              break
+            fi
+
+            if [[ $i -eq $MAX_RETRIES ]]; then
+              echo "::error::Failed to push $BRANCH after $MAX_RETRIES attempts"
+              exit 1
+            fi
+
+            echo "::warning::Push failed, retrying ($i/$MAX_RETRIES)..."
+            git fetch origin "$BRANCH"
+            git rebase "origin/$BRANCH" || git rebase --abort
+            sleep $((i * 2))
+          done
+
+          echo "::endgroup::"
+
+      - name: Create/update PR to target branch
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT: ${{ matrix.artifact }}
+          ARTIFACT_PATH: ${{ inputs.artifact_path }}
+          BRANCH_PREFIX: ${{ inputs.branch_prefix }}
+          SOURCE_PR: ${{ needs.detect-changes.outputs.source_pr }}
+          ATTESTATION_MAP: ${{ needs.detect-changes.outputs.attestation_map }}
+          COMMIT_SHA: ${{ github.sha }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+        run: |
+          # Determine branch name
+          if [[ -n "$BRANCH_PREFIX" ]]; then
+            BRANCH="${BRANCH_PREFIX}/${ARTIFACT}"
+          else
+            BRANCH="${ARTIFACT_PATH}/${ARTIFACT}"
+          fi
+
+          echo "::group::PR operations for $ARTIFACT"
+
+          # Check for existing PR
+          EXISTING_PR=$(gh pr list --head "$BRANCH" --base "$TARGET_BRANCH" --json number --jq '.[0].number' 2>/dev/null || echo "")
+
+          # Build PR body
+          {
+            echo "## Artifact: $ARTIFACT"
+            echo ""
+            echo "Promoting changes from $SOURCE_BRANCH branch to $TARGET_BRANCH."
+            echo ""
+            echo "### Source"
+            if [[ -n "$SOURCE_PR" ]]; then
+              echo "- Source PR: #$SOURCE_PR"
+            else
+              echo "- Source PR: _(not found)_"
+            fi
+            echo "- Source Branch: $SOURCE_BRANCH"
+            echo "- Source Commit: \`$COMMIT_SHA\`"
+            echo ""
+            echo "### Attestation Lineage"
+            echo "This PR carries forward the attestation chain from the source PR."
+            echo ""
+            echo "<!-- ATTESTATION_MAP"
+            echo "$ATTESTATION_MAP"
+            echo "-->"
+            echo ""
+            echo "---"
+            echo "*This PR was automatically created by the Atomize Changes workflow.*"
+          } > pr_body.md
+
+          PR_BODY=$(cat pr_body.md)
+
+          if [[ -n "$EXISTING_PR" ]]; then
+            echo "::notice::Updating existing PR #$EXISTING_PR for $ARTIFACT"
+            gh pr edit "$EXISTING_PR" --body "$PR_BODY"
+            echo "pr_number=$EXISTING_PR" >> "$GITHUB_OUTPUT"
+            echo "pr_action=updated" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Creating new PR for $ARTIFACT"
+            NEW_PR=$(gh pr create \
+              --head "$BRANCH" \
+              --base "$TARGET_BRANCH" \
+              --title "chore(${ARTIFACT}): promote to $TARGET_BRANCH" \
+              --body "$PR_BODY" 2>&1 || true)
+
+            if [[ "$NEW_PR" =~ github.com/.*/pull/([0-9]+) ]]; then
+              PR_NUM="${BASH_REMATCH[1]}"
+              echo "::notice::Created PR #$PR_NUM"
+              echo "pr_number=$PR_NUM" >> "$GITHUB_OUTPUT"
+              echo "pr_action=created" >> "$GITHUB_OUTPUT"
+            else
+              # Check if PR already exists (race condition)
+              EXISTING_PR=$(gh pr list --head "$BRANCH" --base "$TARGET_BRANCH" --json number --jq '.[0].number' 2>/dev/null || echo "")
+              if [[ -n "$EXISTING_PR" ]]; then
+                echo "::notice::PR #$EXISTING_PR already exists (race condition)"
+                gh pr edit "$EXISTING_PR" --body "$PR_BODY"
+                echo "pr_number=$EXISTING_PR" >> "$GITHUB_OUTPUT"
+                echo "pr_action=updated" >> "$GITHUB_OUTPUT"
+              else
+                echo "::error::Failed to create PR: $NEW_PR"
+                echo "pr_number=" >> "$GITHUB_OUTPUT"
+                echo "pr_action=failed" >> "$GITHUB_OUTPUT"
+              fi
+            fi
+          fi
+
+          echo "::endgroup::"
+
+      - name: Trigger validation workflow
+        if: inputs.trigger_validation != '' && steps.pr.outputs.pr_number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT: ${{ matrix.artifact }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          EVENT_TYPE: ${{ inputs.trigger_validation }}
+        run: |
+          echo "::notice::Triggering validation for PR #$PR_NUMBER (artifact: $ARTIFACT)"
+
+          jq -n --argjson pr "$PR_NUMBER" --arg artifact "$ARTIFACT" \
+            '{event_type: env.EVENT_TYPE, client_payload: {pr: $pr, artifact: $artifact}}' | \
+          gh api "repos/${{ github.repository }}/dispatches" \
+            --method POST \
+            --input -
+
+          echo "::notice::Validation triggered successfully"
+
+  #############################################################################
+  # Generate Attestation and Summary
+  #############################################################################
+  finalize:
+    name: Finalize
+    needs: [detect-changes, process-artifacts]
+    if: always() && needs.detect-changes.outputs.artifacts_count != '0'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate atomization attestation
+        id: digest
+        env:
+          ARTIFACTS: ${{ needs.detect-changes.outputs.artifacts }}
+          SOURCE_PR: ${{ needs.detect-changes.outputs.source_pr }}
+        run: |
+          SUBJECT_CONTENT=$(cat <<EOF
+          {
+            "workflow": "atomize-changes",
+            "source_pr": "$SOURCE_PR",
+            "artifacts_processed": "$ARTIFACTS",
+            "source_commit": "${{ github.sha }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+          )
+
+          DIGEST=$(echo -n "$SUBJECT_CONTENT" | sha256sum | cut -d' ' -f1)
+          echo "digest=sha256:$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Create attestation
+        id: attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: "atomize-changes"
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          push-to-registry: false
+
+      - name: Generate summary
+        env:
+          ARTIFACTS: ${{ needs.detect-changes.outputs.artifacts }}
+          SOURCE_PR: ${{ needs.detect-changes.outputs.source_pr }}
+          ATTESTATION_ID: ${{ steps.attestation.outputs.attestation-id }}
+          ARTIFACT_PATH: ${{ inputs.artifact_path }}
+          BRANCH_PREFIX: ${{ inputs.branch_prefix }}
+        run: |
+          echo "## Atomize Changes Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "### Source" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          if [[ -n "$SOURCE_PR" ]]; then
+            echo "- **Source PR**: #$SOURCE_PR" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Source PR**: _(not found)_" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "### Artifacts Processed" >> $GITHUB_STEP_SUMMARY
+          echo "| Artifact | Branch | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+
+          PREFIX="${BRANCH_PREFIX:-$ARTIFACT_PATH}"
+          for artifact in $ARTIFACTS; do
+            echo "| $artifact | \`${PREFIX}/${artifact}\` | :white_check_mark: Processed |" >> $GITHUB_STEP_SUMMARY
+          done
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "### Attestation" >> $GITHUB_STEP_SUMMARY
+          echo "- **Attestation ID**: \`$ATTESTATION_ID\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "*PRs to ${{ inputs.target_branch }} have been created/updated for each artifact.*" >> $GITHUB_STEP_SUMMARY
+
+  #############################################################################
+  # Handle no-change scenario
+  #############################################################################
+  no-changes:
+    name: No Changes
+    needs: detect-changes
+    if: needs.detect-changes.outputs.artifacts_count == '0'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          echo "## Atomize Changes Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo ":information_source: No actionable changes detected in this push." >> $GITHUB_STEP_SUMMARY
