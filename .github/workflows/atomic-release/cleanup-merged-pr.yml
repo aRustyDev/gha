@@ -1,0 +1,90 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+#
+# Cleanup Merged PR
+#
+# Reusable workflow to clean up source branches after PR merge.
+# Deletes the head branch of a merged PR.
+#
+# Usage:
+#   cleanup:
+#     if: github.event.action == 'closed' && github.event.pull_request.merged == true
+#     uses: arustydev/gha/.github/workflows/atomic-release/cleanup-merged-pr.yml@atomic-release-v0.1.0
+#     with:
+#       github_app_id_secret_ref: "op://vault/item/field"
+#       github_app_key_secret_ref: "op://vault/item/field"
+#     secrets:
+#       OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+name: Cleanup Merged PR
+
+on:
+  workflow_call:
+    inputs:
+      github_app_id_secret_ref:
+        description: "1Password reference for GitHub App ID"
+        type: string
+        required: true
+      github_app_key_secret_ref:
+        description: "1Password reference for GitHub App private key"
+        type: string
+        required: true
+    secrets:
+      OP_SERVICE_ACCOUNT_TOKEN:
+        description: "1Password service account token"
+        required: true
+
+jobs:
+  cleanup-branch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Load secrets from 1Password
+        id: op-secrets
+        uses: 1password/load-secrets-action@v3
+        with:
+          export-env: false
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          X_REPO_AUTH_APP_ID: ${{ inputs.github_app_id_secret_ref }}
+          X_REPO_AUTH_PRIVATE_KEY: ${{ inputs.github_app_key_secret_ref }}
+
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ steps.op-secrets.outputs.X_REPO_AUTH_APP_ID }}
+          private-key: ${{ steps.op-secrets.outputs.X_REPO_AUTH_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Delete Source Branch
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          HEAD_REF="${{ github.event.pull_request.head.ref }}"
+
+          echo "::notice::PR merged, cleaning up branch: $HEAD_REF"
+
+          # Delete the source branch
+          if git ls-remote --heads origin "$HEAD_REF" | grep -q "$HEAD_REF"; then
+            git push origin --delete "$HEAD_REF"
+            echo "::notice::Deleted branch: $HEAD_REF"
+          else
+            echo "::notice::Branch $HEAD_REF already deleted"
+          fi
+
+      - name: Generate Summary
+        run: |
+          {
+            echo "## PR Cleanup"
+            echo ""
+            echo "PR #${{ github.event.pull_request.number }} was merged."
+            echo ""
+            echo "### Actions Taken"
+            echo "- :white_check_mark: Deleted source branch: \`${{ github.event.pull_request.head.ref }}\`"
+            echo ""
+            echo "---"
+            echo "*Cleanup performed by reusable workflow*"
+          } >> "$GITHUB_STEP_SUMMARY"
