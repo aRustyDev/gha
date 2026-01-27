@@ -1,0 +1,133 @@
+name: "Validate Source Branch"
+description: "Validate that a PR's source branch matches an expected pattern"
+author: "aRustyDev"
+
+branding:
+  icon: "git-branch"
+  color: "green"
+
+inputs:
+  source-branch:
+    description: "The source branch of the PR to validate"
+    required: true
+  allowed-pattern:
+    description: "Allowed branch pattern(s). Supports glob patterns. Comma-separated for multiple patterns."
+    required: true
+  denied-pattern:
+    description: "Denied branch pattern(s). Takes precedence over allowed. Comma-separated for multiple patterns."
+    required: false
+    default: ""
+  use-regex:
+    description: "Use regex instead of glob patterns"
+    required: false
+    default: "false"
+  fail-on-invalid:
+    description: "Fail the action if branch is invalid"
+    required: false
+    default: "true"
+
+outputs:
+  valid:
+    description: "'true' if branch matches allowed pattern and not denied"
+    value: ${{ steps.validate.outputs.valid }}
+  pattern-matched:
+    description: "The pattern that matched (for multiple patterns)"
+    value: ${{ steps.validate.outputs.pattern-matched }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate source branch
+      id: validate
+      shell: bash
+      env:
+        SOURCE_BRANCH: ${{ inputs.source-branch }}
+        ALLOWED_PATTERN: ${{ inputs.allowed-pattern }}
+        DENIED_PATTERN: ${{ inputs.denied-pattern }}
+        USE_REGEX: ${{ inputs.use-regex }}
+        FAIL_ON_INVALID: ${{ inputs.fail-on-invalid }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Validating source branch"
+        echo "Source branch: $SOURCE_BRANCH"
+        echo "Allowed patterns: $ALLOWED_PATTERN"
+        echo "Denied patterns: $DENIED_PATTERN"
+        echo "Use regex: $USE_REGEX"
+
+        valid="false"
+        pattern_matched=""
+
+        # Function to check if branch matches a pattern
+        match_pattern() {
+          local branch="$1"
+          local pattern="$2"
+          local use_regex="$3"
+
+          if [[ "$use_regex" == "true" ]]; then
+            # Use regex matching
+            if [[ "$branch" =~ $pattern ]]; then
+              return 0
+            fi
+          else
+            # Use glob matching (bash pattern matching)
+            # shellcheck disable=SC2053
+            if [[ "$branch" == $pattern ]]; then
+              return 0
+            fi
+          fi
+          return 1
+        }
+
+        # Check denied patterns first (they take precedence)
+        if [[ -n "$DENIED_PATTERN" ]]; then
+          IFS=',' read -ra denied_patterns <<< "$DENIED_PATTERN"
+          for pattern in "${denied_patterns[@]}"; do
+            pattern=$(echo "$pattern" | xargs)  # Trim whitespace
+            if [[ -z "$pattern" ]]; then
+              continue
+            fi
+            if match_pattern "$SOURCE_BRANCH" "$pattern" "$USE_REGEX"; then
+              echo "::error::Source branch '$SOURCE_BRANCH' matches denied pattern '$pattern'"
+              valid="false"
+              pattern_matched="$pattern (denied)"
+              echo "valid=false" >> "$GITHUB_OUTPUT"
+              echo "pattern-matched=$pattern (denied)" >> "$GITHUB_OUTPUT"
+              echo "::endgroup::"
+              if [[ "$FAIL_ON_INVALID" == "true" ]]; then
+                exit 1
+              fi
+              exit 0
+            fi
+          done
+        fi
+
+        # Check allowed patterns
+        IFS=',' read -ra allowed_patterns <<< "$ALLOWED_PATTERN"
+        for pattern in "${allowed_patterns[@]}"; do
+          pattern=$(echo "$pattern" | xargs)  # Trim whitespace
+          if [[ -z "$pattern" ]]; then
+            continue
+          fi
+          echo "Checking pattern: $pattern"
+          if match_pattern "$SOURCE_BRANCH" "$pattern" "$USE_REGEX"; then
+            echo "::notice::Source branch '$SOURCE_BRANCH' matches allowed pattern '$pattern'"
+            valid="true"
+            pattern_matched="$pattern"
+            break
+          fi
+        done
+
+        echo "::endgroup::"
+
+        # Set outputs
+        echo "valid=$valid" >> "$GITHUB_OUTPUT"
+        echo "pattern-matched=$pattern_matched" >> "$GITHUB_OUTPUT"
+
+        if [[ "$valid" != "true" ]]; then
+          echo "::error::Source branch '$SOURCE_BRANCH' does not match any allowed pattern"
+          echo "::error::Allowed patterns: $ALLOWED_PATTERN"
+          if [[ "$FAIL_ON_INVALID" == "true" ]]; then
+            exit 1
+          fi
+        fi

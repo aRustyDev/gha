@@ -1,0 +1,93 @@
+name: "Trigger Repository Dispatch"
+description: "Trigger repository_dispatch events to invoke other workflows"
+author: "aRustyDev"
+
+branding:
+  icon: "send"
+  color: "purple"
+
+inputs:
+  event-type:
+    description: "Event type to dispatch"
+    required: true
+  client-payload:
+    description: "JSON payload to send with the event"
+    required: false
+    default: "{}"
+  repository:
+    description: "Target repository (owner/repo format)"
+    required: false
+    default: ${{ github.repository }}
+  token:
+    description: "GitHub token (needs repo scope for cross-repo dispatch)"
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  dispatched:
+    description: "'true' if successfully dispatched"
+    value: ${{ steps.dispatch.outputs.dispatched }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate payload
+      id: validate
+      shell: bash
+      env:
+        CLIENT_PAYLOAD: ${{ inputs.client-payload }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Validating client payload"
+
+        # Validate JSON syntax
+        if ! echo "$CLIENT_PAYLOAD" | jq -e . >/dev/null 2>&1; then
+          echo "::error::Invalid JSON in client-payload: $CLIENT_PAYLOAD"
+          exit 1
+        fi
+
+        echo "Payload is valid JSON"
+        echo "$CLIENT_PAYLOAD" | jq .
+        echo "::endgroup::"
+
+    - name: Trigger dispatch
+      id: dispatch
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        EVENT_TYPE: ${{ inputs.event-type }}
+        CLIENT_PAYLOAD: ${{ inputs.client-payload }}
+        REPOSITORY: ${{ inputs.repository }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Triggering repository dispatch"
+        echo "Event type: $EVENT_TYPE"
+        echo "Repository: $REPOSITORY"
+
+        # Build the request body
+        request_body=$(jq -n \
+          --arg event_type "$EVENT_TYPE" \
+          --argjson client_payload "$CLIENT_PAYLOAD" \
+          '{event_type: $event_type, client_payload: $client_payload}')
+
+        echo "Request body:"
+        echo "$request_body" | jq .
+
+        # Dispatch the event
+        if gh api \
+          --method POST \
+          -H "Accept: application/vnd.github+json" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          "/repos/$REPOSITORY/dispatches" \
+          --input - <<< "$request_body"; then
+          echo "::notice::Successfully dispatched '$EVENT_TYPE' to $REPOSITORY"
+          echo "dispatched=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "::error::Failed to dispatch event"
+          echo "dispatched=false" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+
+        echo "::endgroup::"

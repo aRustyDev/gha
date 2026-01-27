@@ -1,0 +1,225 @@
+name: "Verify CODEOWNERS"
+description: "Verify that the workflow actor is listed in CODEOWNERS for relevant paths"
+author: "aRustyDev"
+
+branding:
+  icon: "shield"
+  color: "green"
+
+inputs:
+  actor:
+    description: "GitHub username to verify"
+    required: false
+    default: ${{ github.actor }}
+  paths:
+    description: "Paths to check ownership for (comma-separated)"
+    required: false
+    default: ""
+  codeowners-path:
+    description: "Path to CODEOWNERS file"
+    required: false
+    default: ".github/CODEOWNERS"
+  token:
+    description: "GitHub token for team membership checks"
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  is-owner:
+    description: "'true' if actor is a codeowner for the paths"
+    value: ${{ steps.check.outputs.is-owner }}
+  matched-pattern:
+    description: "CODEOWNERS pattern that matched"
+    value: ${{ steps.check.outputs.matched-pattern }}
+  owners:
+    description: "Comma-separated list of owners for the matched pattern"
+    value: ${{ steps.check.outputs.owners }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Check CODEOWNERS
+      id: check
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        ACTOR: ${{ inputs.actor }}
+        PATHS: ${{ inputs.paths }}
+        CODEOWNERS_PATH: ${{ inputs.codeowners-path }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Checking CODEOWNERS"
+        echo "Actor: $ACTOR"
+        echo "Paths: $PATHS"
+        echo "CODEOWNERS file: $CODEOWNERS_PATH"
+
+        is_owner="false"
+        matched_pattern=""
+        owners=""
+
+        # Check if CODEOWNERS file exists
+        if [[ ! -f "$CODEOWNERS_PATH" ]]; then
+          echo "::warning::CODEOWNERS file not found at $CODEOWNERS_PATH"
+          echo "is-owner=false" >> "$GITHUB_OUTPUT"
+          echo "matched-pattern=" >> "$GITHUB_OUTPUT"
+          echo "owners=" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+          exit 0
+        fi
+
+        # Function to check if actor is in a team
+        check_team_membership() {
+          local team_spec="$1"  # Format: @org/team-name
+          local actor="$2"
+
+          # Extract org and team from @org/team-name
+          local org team
+          org=$(echo "$team_spec" | sed 's/@//' | cut -d'/' -f1)
+          team=$(echo "$team_spec" | cut -d'/' -f2)
+
+          echo "Checking if $actor is member of $org/$team"
+
+          # Query GitHub API for team membership
+          if gh api "/orgs/$org/teams/$team/memberships/$actor" >/dev/null 2>&1; then
+            return 0
+          fi
+          return 1
+        }
+
+        # Function to check if a path matches a CODEOWNERS pattern
+        path_matches_pattern() {
+          local path="$1"
+          local pattern="$2"
+
+          # Handle different pattern types
+          if [[ "$pattern" == "*" ]]; then
+            return 0
+          elif [[ "$pattern" == /* ]]; then
+            # Absolute path pattern (from repo root)
+            pattern="${pattern:1}"  # Remove leading /
+            # shellcheck disable=SC2053
+            if [[ "$path" == $pattern* ]] || [[ "$path" == $pattern ]]; then
+              return 0
+            fi
+          elif [[ "$pattern" == *"*"* ]]; then
+            # Glob pattern
+            # shellcheck disable=SC2053
+            if [[ "$path" == $pattern ]]; then
+              return 0
+            fi
+          else
+            # Simple path prefix
+            if [[ "$path" == "$pattern"* ]] || [[ "$path" == "$pattern" ]]; then
+              return 0
+            fi
+          fi
+          return 1
+        }
+
+        # Function to check if actor matches an owner entry
+        actor_matches_owner() {
+          local actor="$1"
+          local owner="$2"
+
+          # Direct user match
+          if [[ "$owner" == "@$actor" ]]; then
+            return 0
+          fi
+
+          # Team match
+          if [[ "$owner" == @*/* ]]; then
+            if check_team_membership "$owner" "$actor"; then
+              return 0
+            fi
+          fi
+
+          # Email match (if actor has email in profile)
+          # This is a simplified check - full implementation would need API call
+          if [[ "$owner" == *"@"* && "$owner" != @* ]]; then
+            echo "::debug::Email patterns not fully supported: $owner"
+          fi
+
+          return 1
+        }
+
+        # If no paths specified, check if actor is any codeowner
+        if [[ -z "$PATHS" ]]; then
+          echo "No specific paths provided, checking if actor is listed anywhere in CODEOWNERS"
+
+          while IFS= read -r line || [[ -n "$line" ]]; do
+            # Skip comments and empty lines
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "${line// }" ]] && continue
+
+            # Parse line: pattern owner1 owner2 ...
+            read -r pattern owners_str <<< "$line"
+
+            for owner in $owners_str; do
+              if actor_matches_owner "$ACTOR" "$owner"; then
+                is_owner="true"
+                matched_pattern="$pattern"
+                owners="$owners_str"
+                echo "::notice::Actor $ACTOR is a codeowner for pattern: $pattern"
+                break 2
+              fi
+            done
+          done < "$CODEOWNERS_PATH"
+        else
+          # Check specific paths
+          IFS=',' read -ra path_array <<< "$PATHS"
+          for path in "${path_array[@]}"; do
+            path=$(echo "$path" | xargs)  # Trim whitespace
+            [[ -z "$path" ]] && continue
+
+            echo "Checking ownership for path: $path"
+
+            # Find matching CODEOWNERS entry (last match wins per CODEOWNERS spec)
+            last_match_pattern=""
+            last_match_owners=""
+
+            while IFS= read -r line || [[ -n "$line" ]]; do
+              # Skip comments and empty lines
+              [[ "$line" =~ ^[[:space:]]*# ]] && continue
+              [[ -z "${line// }" ]] && continue
+
+              # Parse line: pattern owner1 owner2 ...
+              read -r pattern owners_str <<< "$line"
+
+              if path_matches_pattern "$path" "$pattern"; then
+                last_match_pattern="$pattern"
+                last_match_owners="$owners_str"
+              fi
+            done < "$CODEOWNERS_PATH"
+
+            if [[ -n "$last_match_pattern" ]]; then
+              echo "Path '$path' matches pattern '$last_match_pattern' with owners: $last_match_owners"
+
+              for owner in $last_match_owners; do
+                if actor_matches_owner "$ACTOR" "$owner"; then
+                  is_owner="true"
+                  matched_pattern="$last_match_pattern"
+                  owners="$last_match_owners"
+                  echo "::notice::Actor $ACTOR is a codeowner for path '$path' via pattern '$matched_pattern'"
+                  break 2
+                fi
+              done
+            fi
+          done
+        fi
+
+        echo "::endgroup::"
+
+        # Format owners as comma-separated
+        owners_csv=$(echo "$owners" | tr ' ' ',' | sed 's/,$//')
+
+        # Set outputs
+        echo "is-owner=$is_owner" >> "$GITHUB_OUTPUT"
+        echo "matched-pattern=$matched_pattern" >> "$GITHUB_OUTPUT"
+        echo "owners=$owners_csv" >> "$GITHUB_OUTPUT"
+
+        if [[ "$is_owner" == "true" ]]; then
+          echo "::notice::Verified: $ACTOR is a codeowner"
+        else
+          echo "::warning::$ACTOR is not a codeowner for the specified paths"
+        fi

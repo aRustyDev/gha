@@ -1,0 +1,188 @@
+name: "Verify Commit Signatures"
+description: "Verify GPG/SSH commit signatures in a commit range"
+author: "aRustyDev"
+
+branding:
+  icon: "check-circle"
+  color: "green"
+
+inputs:
+  commit-range:
+    description: "Commit range to verify (e.g., origin/main..HEAD)"
+    required: false
+    default: "HEAD~1..HEAD"
+  require-all:
+    description: "Require all commits to be signed"
+    required: false
+    default: "true"
+  allowed-keys:
+    description: "Allowed GPG key IDs (comma-separated). Empty means allow any valid signature."
+    required: false
+    default: ""
+  verify-github:
+    description: "Accept GitHub's web-flow signature (commits made via GitHub UI)"
+    required: false
+    default: "true"
+
+outputs:
+  all-signed:
+    description: "'true' if all commits are signed"
+    value: ${{ steps.verify.outputs.all-signed }}
+  signed-count:
+    description: "Number of signed commits"
+    value: ${{ steps.verify.outputs.signed-count }}
+  unsigned-count:
+    description: "Number of unsigned commits"
+    value: ${{ steps.verify.outputs.unsigned-count }}
+  unsigned-commits:
+    description: "Comma-separated list of unsigned commit SHAs"
+    value: ${{ steps.verify.outputs.unsigned-commits }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Verify signatures
+      id: verify
+      shell: bash
+      env:
+        COMMIT_RANGE: ${{ inputs.commit-range }}
+        REQUIRE_ALL: ${{ inputs.require-all }}
+        ALLOWED_KEYS: ${{ inputs.allowed-keys }}
+        VERIFY_GITHUB: ${{ inputs.verify-github }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Verifying commit signatures"
+        echo "Commit range: $COMMIT_RANGE"
+        echo "Require all signed: $REQUIRE_ALL"
+        echo "Verify GitHub signatures: $VERIFY_GITHUB"
+
+        # GitHub's web-flow GPG key fingerprints
+        # See: https://docs.github.com/en/authentication/managing-commit-signature-verification/about-commit-signature-verification
+        GITHUB_WEB_FLOW_KEY="4AEE18F83AFDEB23"
+        GITHUB_WEB_FLOW_KEY_NOREPLY="B5690EEEBB952194"
+
+        signed_count=0
+        unsigned_count=0
+        unsigned_commits=""
+        all_signed="true"
+
+        # Get list of commits in range
+        commits=$(git rev-list "$COMMIT_RANGE" 2>/dev/null || echo "")
+
+        if [[ -z "$commits" ]]; then
+          echo "::warning::No commits found in range: $COMMIT_RANGE"
+          echo "all-signed=true" >> "$GITHUB_OUTPUT"
+          echo "signed-count=0" >> "$GITHUB_OUTPUT"
+          echo "unsigned-count=0" >> "$GITHUB_OUTPUT"
+          echo "unsigned-commits=" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+          exit 0
+        fi
+
+        # Count total commits
+        total_commits=$(echo "$commits" | wc -l | tr -d ' ')
+        echo "Total commits to verify: $total_commits"
+
+        # Parse allowed keys into array
+        IFS=',' read -ra allowed_keys_array <<< "$ALLOWED_KEYS"
+
+        # Verify each commit
+        for commit in $commits; do
+          short_sha="${commit:0:7}"
+          echo "---"
+          echo "Checking commit: $short_sha"
+
+          # Get commit info
+          commit_author=$(git log -1 --format="%an <%ae>" "$commit")
+          commit_subject=$(git log -1 --format="%s" "$commit")
+          echo "Author: $commit_author"
+          echo "Subject: $commit_subject"
+
+          # Try to verify the commit signature
+          sig_status=""
+          key_id=""
+
+          # Use git verify-commit and capture output
+          verify_output=$(git verify-commit "$commit" 2>&1 || true)
+
+          if echo "$verify_output" | grep -qE "(Good signature|Signature made)"; then
+            sig_status="good"
+
+            # Extract key ID from verification output
+            key_id=$(echo "$verify_output" | grep -oE 'key (ID )?[A-F0-9]+' | grep -oE '[A-F0-9]+' | head -1 || true)
+
+            # Check if this is a GitHub web-flow signature
+            if [[ "$key_id" == "$GITHUB_WEB_FLOW_KEY" || "$key_id" == "$GITHUB_WEB_FLOW_KEY_NOREPLY" ]]; then
+              if [[ "$VERIFY_GITHUB" == "true" ]]; then
+                echo "::notice::Commit $short_sha: Signed with GitHub web-flow key"
+                ((signed_count++))
+              else
+                echo "::warning::Commit $short_sha: GitHub web-flow signature not accepted"
+                sig_status="rejected"
+              fi
+            elif [[ -n "$ALLOWED_KEYS" ]]; then
+              # Check if key is in allowed list
+              key_allowed="false"
+              for allowed_key in "${allowed_keys_array[@]}"; do
+                allowed_key=$(echo "$allowed_key" | xargs)  # Trim whitespace
+                if [[ "$key_id" == *"$allowed_key"* ]]; then
+                  key_allowed="true"
+                  break
+                fi
+              done
+
+              if [[ "$key_allowed" == "true" ]]; then
+                echo "::notice::Commit $short_sha: Signed with allowed key $key_id"
+                ((signed_count++))
+              else
+                echo "::warning::Commit $short_sha: Signed with non-allowed key $key_id"
+                sig_status="rejected"
+              fi
+            else
+              echo "::notice::Commit $short_sha: Valid signature (key: $key_id)"
+              ((signed_count++))
+            fi
+          elif echo "$verify_output" | grep -q "No signature"; then
+            sig_status="unsigned"
+            echo "::warning::Commit $short_sha: No signature found"
+          else
+            sig_status="invalid"
+            echo "::warning::Commit $short_sha: Invalid or unverifiable signature"
+          fi
+
+          # Handle unsigned/rejected commits
+          if [[ "$sig_status" != "good" ]] || [[ "$sig_status" == "rejected" ]]; then
+            if [[ "$sig_status" == "unsigned" || "$sig_status" == "invalid" || "$sig_status" == "rejected" ]]; then
+              ((unsigned_count++))
+              all_signed="false"
+              if [[ -z "$unsigned_commits" ]]; then
+                unsigned_commits="$short_sha"
+              else
+                unsigned_commits="$unsigned_commits,$short_sha"
+              fi
+            fi
+          fi
+        done
+
+        echo "---"
+        echo "::endgroup::"
+
+        # Summary
+        echo "::notice::Signature verification complete: $signed_count/$total_commits signed"
+
+        if [[ "$all_signed" != "true" ]]; then
+          echo "::warning::Unsigned commits: $unsigned_commits"
+        fi
+
+        # Set outputs
+        echo "all-signed=$all_signed" >> "$GITHUB_OUTPUT"
+        echo "signed-count=$signed_count" >> "$GITHUB_OUTPUT"
+        echo "unsigned-count=$unsigned_count" >> "$GITHUB_OUTPUT"
+        echo "unsigned-commits=$unsigned_commits" >> "$GITHUB_OUTPUT"
+
+        # Fail if required and not all signed
+        if [[ "$REQUIRE_ALL" == "true" && "$all_signed" != "true" ]]; then
+          echo "::error::Not all commits are signed and require-all is enabled"
+          exit 1
+        fi

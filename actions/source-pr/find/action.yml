@@ -1,0 +1,179 @@
+name: "Find Source PR"
+description: "Find the source PR from a merge commit by parsing commit message or querying GitHub API"
+author: "aRustyDev"
+
+branding:
+  icon: "git-pull-request"
+  color: "blue"
+
+inputs:
+  commit-sha:
+    description: "Commit SHA to check"
+    required: false
+    default: ${{ github.sha }}
+  prefer:
+    description: "Preference when multiple PRs found: first, merged, or open"
+    required: false
+    default: "merged"
+  token:
+    description: "GitHub token for API access"
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  pr-number:
+    description: "PR number if found, empty otherwise"
+    value: ${{ steps.find.outputs.pr-number }}
+  found:
+    description: "'true' if PR was found"
+    value: ${{ steps.find.outputs.found }}
+  author:
+    description: "PR author login"
+    value: ${{ steps.find.outputs.author }}
+  labels:
+    description: "Comma-separated list of PR labels"
+    value: ${{ steps.find.outputs.labels }}
+  state:
+    description: "PR state (open, closed, merged)"
+    value: ${{ steps.find.outputs.state }}
+  title:
+    description: "PR title"
+    value: ${{ steps.find.outputs.title }}
+  base-branch:
+    description: "Base branch the PR targets"
+    value: ${{ steps.find.outputs.base-branch }}
+  all-prs-json:
+    description: "JSON array of all associated PRs"
+    value: ${{ steps.find.outputs.all-prs-json }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Find source PR
+      id: find
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        COMMIT_SHA: ${{ inputs.commit-sha }}
+        PREFER: ${{ inputs.prefer }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Finding source PR for commit $COMMIT_SHA"
+
+        # Initialize outputs
+        pr_number=""
+        found="false"
+        author=""
+        labels=""
+        state=""
+        title=""
+        base_branch=""
+        all_prs_json="[]"
+
+        # Method 1: Try to extract PR number from merge commit message
+        commit_message=$(git log -1 --format="%s" "$COMMIT_SHA" 2>/dev/null || echo "")
+        if [[ -n "$commit_message" ]]; then
+          echo "Commit message: $commit_message"
+          # Look for patterns like "(#123)" or "Merge pull request #123"
+          pr_from_message=$(echo "$commit_message" | grep -oE '#[0-9]+' | head -1 | tr -d '#' || true)
+          if [[ -n "$pr_from_message" ]]; then
+            echo "::notice::Found PR #$pr_from_message from commit message"
+            pr_number="$pr_from_message"
+          fi
+        fi
+
+        # Method 2: Query GitHub API for associated PRs
+        repo="${GITHUB_REPOSITORY:-}"
+        if [[ -n "$repo" ]]; then
+          echo "Querying GitHub API for PRs associated with $COMMIT_SHA"
+          api_response=$(gh api "/repos/$repo/commits/$COMMIT_SHA/pulls" \
+            -H "Accept: application/vnd.github+json" 2>/dev/null || echo "[]")
+
+          if [[ "$api_response" != "[]" && "$api_response" != "null" ]]; then
+            all_prs_json="$api_response"
+            pr_count=$(echo "$api_response" | jq 'length')
+            echo "::notice::Found $pr_count PRs associated with commit"
+
+            # Select PR based on preference
+            selected_pr=""
+            case "$PREFER" in
+              merged)
+                selected_pr=$(echo "$api_response" | jq -r '[.[] | select(.merged_at != null)] | first // empty')
+                if [[ -z "$selected_pr" || "$selected_pr" == "null" ]]; then
+                  selected_pr=$(echo "$api_response" | jq -r 'first')
+                fi
+                ;;
+              open)
+                selected_pr=$(echo "$api_response" | jq -r '[.[] | select(.state == "open")] | first // empty')
+                if [[ -z "$selected_pr" || "$selected_pr" == "null" ]]; then
+                  selected_pr=$(echo "$api_response" | jq -r 'first')
+                fi
+                ;;
+              first|*)
+                selected_pr=$(echo "$api_response" | jq -r 'first')
+                ;;
+            esac
+
+            if [[ -n "$selected_pr" && "$selected_pr" != "null" ]]; then
+              pr_number=$(echo "$selected_pr" | jq -r '.number')
+              author=$(echo "$selected_pr" | jq -r '.user.login // ""')
+              title=$(echo "$selected_pr" | jq -r '.title // ""')
+              base_branch=$(echo "$selected_pr" | jq -r '.base.ref // ""')
+              state=$(echo "$selected_pr" | jq -r '.state // ""')
+
+              # Check if merged
+              merged_at=$(echo "$selected_pr" | jq -r '.merged_at // ""')
+              if [[ -n "$merged_at" && "$merged_at" != "null" ]]; then
+                state="merged"
+              fi
+
+              # Get labels
+              labels=$(echo "$selected_pr" | jq -r '[.labels[].name] | join(",")')
+            fi
+          fi
+        fi
+
+        # Validate PR exists if we found a number from commit message
+        if [[ -n "$pr_number" && -z "$author" && -n "$repo" ]]; then
+          echo "Validating PR #$pr_number exists"
+          pr_details=$(gh pr view "$pr_number" --json number,author,title,state,baseRefName,labels,mergedAt 2>/dev/null || echo "")
+          if [[ -n "$pr_details" ]]; then
+            author=$(echo "$pr_details" | jq -r '.author.login // ""')
+            title=$(echo "$pr_details" | jq -r '.title // ""')
+            base_branch=$(echo "$pr_details" | jq -r '.baseRefName // ""')
+            state=$(echo "$pr_details" | jq -r '.state // ""' | tr '[:upper:]' '[:lower:]')
+            labels=$(echo "$pr_details" | jq -r '[.labels[].name] | join(",")')
+
+            merged_at=$(echo "$pr_details" | jq -r '.mergedAt // ""')
+            if [[ -n "$merged_at" && "$merged_at" != "null" ]]; then
+              state="merged"
+            fi
+          fi
+        fi
+
+        # Set found status
+        if [[ -n "$pr_number" ]]; then
+          found="true"
+          echo "::notice::Source PR: #$pr_number (author: $author, state: $state)"
+        else
+          echo "::warning::No source PR found for commit $COMMIT_SHA"
+        fi
+
+        echo "::endgroup::"
+
+        # Set outputs
+        echo "pr-number=$pr_number" >> "$GITHUB_OUTPUT"
+        echo "found=$found" >> "$GITHUB_OUTPUT"
+        echo "author=$author" >> "$GITHUB_OUTPUT"
+        echo "labels=$labels" >> "$GITHUB_OUTPUT"
+        echo "state=$state" >> "$GITHUB_OUTPUT"
+        echo "title=$title" >> "$GITHUB_OUTPUT"
+        echo "base-branch=$base_branch" >> "$GITHUB_OUTPUT"
+
+        # Use heredoc for JSON to handle special characters
+        {
+          echo 'all-prs-json<<EOF'
+          echo "$all_prs_json"
+          echo 'EOF'
+        } >> "$GITHUB_OUTPUT"
