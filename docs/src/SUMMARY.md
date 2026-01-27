@@ -1,0 +1,33 @@
+# Summary
+
+[Introduction](./README.md)
+
+# Actions
+
+- [Actions Overview](./actions/index.md)
+  - [Attestation](./actions/attestation/index.md)
+    - [extract-map](./actions/attestation/extract-map.md)
+    - [generate-digest](./actions/attestation/generate-digest.md)
+    - [update-pr-map](./actions/attestation/update-pr-map.md)
+    - [verify-chain](./actions/attestation/verify-chain.md)
+    - [create](./actions/attestation/create.md)
+  - [Atomic Branch](./actions/atomic-branch/index.md)
+    - [detect-changes](./actions/atomic-branch/detect-changes.md)
+    - [create-branch](./actions/atomic-branch/create-branch.md)
+    - [create-pr](./actions/atomic-branch/create-pr.md)
+  - [Version Bump](./actions/version-bump/index.md)
+    - [determine-bump](./actions/version-bump/determine-bump.md)
+    - [calculate-version](./actions/version-bump/calculate-version.md)
+    - [update-manifest](./actions/version-bump/update-manifest.md)
+  - [Changelog](./actions/changelog/index.md)
+    - [extract-version](./actions/changelog/extract-version.md)
+    - [generate](./actions/changelog/generate.md)
+    - [update](./actions/changelog/update.md)
+  - [Trust Check](./actions/trust-check/index.md)
+    - [validate-source-branch](./actions/trust-check/validate-source-branch.md)
+    - [codeowners](./actions/trust-check/codeowners.md)
+    - [verify-signatures](./actions/trust-check/verify-signatures.md)
+  - [Source PR](./actions/source-pr/index.md)
+    - [find](./actions/source-pr/find.md)
+  - [Dispatch](./actions/dispatch/index.md)
+    - [trigger](./actions/dispatch/trigger.md)
