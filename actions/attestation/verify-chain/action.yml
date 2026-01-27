@@ -1,0 +1,149 @@
+name: "Verify Attestation Chain"
+description: "Verify all attestations in a chain"
+author: "aRustyDev"
+
+branding:
+  icon: "check-circle"
+  color: "green"
+
+inputs:
+  attestation-map:
+    description: "JSON object of check_name to attestation_id"
+    required: true
+  repository:
+    description: "Repository in owner/repo format"
+    required: false
+    default: ${{ github.repository }}
+  fail-fast:
+    description: "Stop on first failure"
+    required: false
+    default: "false"
+  token:
+    description: "GitHub token for API access"
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  verified:
+    description: "true if all attestations valid"
+    value: ${{ steps.verify.outputs.verified }}
+  total:
+    description: "Total number of attestations checked"
+    value: ${{ steps.verify.outputs.total }}
+  passed:
+    description: "Number that passed verification"
+    value: ${{ steps.verify.outputs.passed }}
+  failed:
+    description: "Number that failed verification"
+    value: ${{ steps.verify.outputs.failed }}
+  results-json:
+    description: "Detailed JSON results for each attestation"
+    value: ${{ steps.verify.outputs.results_json }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Verify attestation chain
+      id: verify
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        ATTESTATION_MAP: ${{ inputs.attestation-map }}
+        REPOSITORY: ${{ inputs.repository }}
+        FAIL_FAST: ${{ inputs.fail-fast }}
+      run: |
+        set -euo pipefail
+
+        if [[ -z "$REPOSITORY" ]]; then
+          echo "::error::Repository not provided"
+          exit 1
+        fi
+
+        if [[ -z "$ATTESTATION_MAP" || "$ATTESTATION_MAP" == "{}" ]]; then
+          echo "::error::Empty attestation map provided"
+          echo "verified=false" >> "$GITHUB_OUTPUT"
+          echo "total=0" >> "$GITHUB_OUTPUT"
+          echo "passed=0" >> "$GITHUB_OUTPUT"
+          echo "failed=0" >> "$GITHUB_OUTPUT"
+          echo 'results_json=[]' >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+
+        # Validate JSON
+        if ! echo "$ATTESTATION_MAP" | jq -e . >/dev/null 2>&1; then
+          echo "::error::Invalid JSON in attestation map"
+          exit 1
+        fi
+
+        failed=0
+        total=0
+        verified=0
+        results="[]"
+
+        # Iterate through all attestations
+        while IFS='=' read -r key value; do
+          ((total++))
+          check_name=$(echo "$key" | tr -d '"')
+          attestation_id=$(echo "$value" | tr -d '"')
+
+          echo "::group::Verifying attestation: $check_name"
+          echo "Attestation ID: $attestation_id"
+
+          verification_status="failed"
+          verification_method=""
+
+          # Try OCI bundle verification first
+          if gh attestation verify \
+              --repo "$REPOSITORY" \
+              --bundle-from-oci "oci://ghcr.io/$REPOSITORY/attestations:$attestation_id" 2>/dev/null; then
+            echo "::notice::Verified via OCI: $check_name"
+            verification_status="passed"
+            verification_method="oci"
+            ((verified++))
+          else
+            # Try API verification as fallback
+            if gh api "/repos/$REPOSITORY/attestations/$attestation_id" >/dev/null 2>&1; then
+              echo "::notice::Verified via API: $check_name"
+              verification_status="passed"
+              verification_method="api"
+              ((verified++))
+            else
+              echo "::error::Failed to verify: $check_name ($attestation_id)"
+              ((failed++))
+
+              if [[ "$FAIL_FAST" == "true" ]]; then
+                echo "::endgroup::"
+                echo "::error::Fail-fast enabled, stopping verification"
+                echo "verified=false" >> "$GITHUB_OUTPUT"
+                echo "total=$total" >> "$GITHUB_OUTPUT"
+                echo "passed=$verified" >> "$GITHUB_OUTPUT"
+                echo "failed=$failed" >> "$GITHUB_OUTPUT"
+                echo "results_json=$results" >> "$GITHUB_OUTPUT"
+                exit 1
+              fi
+            fi
+          fi
+
+          # Add to results
+          results=$(echo "$results" | jq -c \
+            --arg name "$check_name" \
+            --arg id "$attestation_id" \
+            --arg status "$verification_status" \
+            --arg method "$verification_method" \
+            '. + [{"check_name": $name, "attestation_id": $id, "status": $status, "method": $method}]')
+
+          echo "::endgroup::"
+        done < <(echo "$ATTESTATION_MAP" | jq -r 'to_entries[] | "\(.key)=\(.value)"')
+
+        echo "::notice::Attestation verification complete: $verified/$total verified, $failed failed"
+
+        if [[ $failed -gt 0 ]]; then
+          echo "verified=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "verified=true" >> "$GITHUB_OUTPUT"
+        fi
+
+        echo "total=$total" >> "$GITHUB_OUTPUT"
+        echo "passed=$verified" >> "$GITHUB_OUTPUT"
+        echo "failed=$failed" >> "$GITHUB_OUTPUT"
+        echo "results_json=$results" >> "$GITHUB_OUTPUT"

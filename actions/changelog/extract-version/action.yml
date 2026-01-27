@@ -1,0 +1,135 @@
+name: "Extract Changelog for Version"
+description: "Extract changelog entries for a specific version from a Keep-a-Changelog format file"
+author: "aRustyDev"
+
+branding:
+  icon: "file-text"
+  color: "blue"
+
+inputs:
+  changelog-path:
+    description: "Path to CHANGELOG.md file"
+    required: true
+  version:
+    description: 'Version to extract (e.g., "1.2.3" or "unreleased")'
+    required: true
+  format:
+    description: "Changelog format: keep-a-changelog, conventional, or auto"
+    required: false
+    default: "auto"
+
+outputs:
+  content:
+    description: "Changelog content for the version (without the header)"
+    value: ${{ steps.extract.outputs.content }}
+  found:
+    description: "Whether the version section was found (true/false)"
+    value: ${{ steps.extract.outputs.found }}
+  date:
+    description: "Release date if present in the header"
+    value: ${{ steps.extract.outputs.date }}
+  compare-url:
+    description: "Comparison URL if present in the header"
+    value: ${{ steps.extract.outputs.compare_url }}
+  previous-version:
+    description: "Previous version if comparison URL was parsed"
+    value: ${{ steps.extract.outputs.previous_version }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Extract changelog section
+      id: extract
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        CHANGELOG_PATH="${{ inputs.changelog-path }}"
+        VERSION="${{ inputs.version }}"
+        FORMAT="${{ inputs.format }}"
+
+        # Validate inputs
+        if [[ ! -f "$CHANGELOG_PATH" ]]; then
+          echo "::warning::Changelog file not found: $CHANGELOG_PATH"
+          echo "found=false" >> "$GITHUB_OUTPUT"
+          echo "content=" >> "$GITHUB_OUTPUT"
+          echo "date=" >> "$GITHUB_OUTPUT"
+          echo "compare_url=" >> "$GITHUB_OUTPUT"
+          echo "previous_version=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Normalize version input
+        VERSION_PATTERN="$VERSION"
+        if [[ "${VERSION,,}" == "unreleased" ]]; then
+          VERSION_PATTERN="Unreleased"
+        fi
+
+        echo "::debug::Extracting version $VERSION_PATTERN from $CHANGELOG_PATH"
+
+        # Extract the section for this version
+        # Handles both [VERSION] and [VERSION] - DATE formats
+        SECTION=$(awk -v ver="$VERSION_PATTERN" '
+          BEGIN { found=0; in_section=0 }
+          /^## \[/ {
+            if (in_section) { exit }
+            # Match version (case-insensitive for Unreleased)
+            if (tolower($0) ~ "\\[" tolower(ver) "\\]") {
+              found=1
+              in_section=1
+              header=$0
+              next
+            }
+          }
+          in_section { content = content $0 "\n" }
+          END {
+            if (found) {
+              print "HEADER:" header
+              print "CONTENT:" content
+            }
+          }
+        ' "$CHANGELOG_PATH")
+
+        if [[ -z "$SECTION" ]]; then
+          echo "::notice::Version $VERSION not found in changelog"
+          echo "found=false" >> "$GITHUB_OUTPUT"
+          echo "content=" >> "$GITHUB_OUTPUT"
+          echo "date=" >> "$GITHUB_OUTPUT"
+          echo "compare_url=" >> "$GITHUB_OUTPUT"
+          echo "previous_version=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Parse header and content
+        HEADER=$(echo "$SECTION" | grep "^HEADER:" | sed 's/^HEADER://')
+        CONTENT=$(echo "$SECTION" | sed -n '/^CONTENT:/,$p' | sed '1s/^CONTENT://' | sed '/^$/d')
+
+        # Extract date from header (format: ## [VERSION] - YYYY-MM-DD)
+        DATE=""
+        if [[ "$HEADER" =~ -[[:space:]]*([0-9]{4}-[0-9]{2}-[0-9]{2}) ]]; then
+          DATE="${BASH_REMATCH[1]}"
+        fi
+
+        # Extract comparison URL if present (format: ## [VERSION](URL))
+        COMPARE_URL=""
+        PREVIOUS_VERSION=""
+        if [[ "$HEADER" =~ \]\(([^)]+)\) ]]; then
+          COMPARE_URL="${BASH_REMATCH[1]}"
+          # Try to extract previous version from compare URL
+          if [[ "$COMPARE_URL" =~ compare/v?([0-9]+\.[0-9]+\.[0-9]+)\.\.\.v?([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            PREVIOUS_VERSION="${BASH_REMATCH[1]}"
+          fi
+        fi
+
+        echo "::notice::Found changelog section for version $VERSION"
+        echo "found=true" >> "$GITHUB_OUTPUT"
+        echo "date=$DATE" >> "$GITHUB_OUTPUT"
+        echo "compare_url=$COMPARE_URL" >> "$GITHUB_OUTPUT"
+        echo "previous_version=$PREVIOUS_VERSION" >> "$GITHUB_OUTPUT"
+
+        # Handle multiline content output
+        {
+          echo "content<<EOF"
+          echo "$CONTENT"
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"

@@ -1,0 +1,144 @@
+name: "Update PR Attestation Map"
+description: "Update attestation map in PR description"
+author: "aRustyDev"
+
+branding:
+  icon: "edit"
+  color: "blue"
+
+inputs:
+  pr-number:
+    description: "PR number to update"
+    required: true
+  check-name:
+    description: "Name of the check (e.g., 'lint-test-v1.32.11')"
+    required: true
+  attestation-id:
+    description: "The attestation ID to store"
+    required: true
+  action:
+    description: "Action to perform: 'add' or 'remove'"
+    required: false
+    default: "add"
+  token:
+    description: "GitHub token for API access"
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  updated:
+    description: "true if successfully updated"
+    value: ${{ steps.update.outputs.updated }}
+  map:
+    description: "Updated JSON object"
+    value: ${{ steps.update.outputs.map }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Update attestation map
+      id: update
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        CHECK_NAME: ${{ inputs.check-name }}
+        ATTESTATION_ID: ${{ inputs.attestation-id }}
+        ACTION: ${{ inputs.action }}
+      run: |
+        set -euo pipefail
+
+        if [[ -z "$PR_NUMBER" ]]; then
+          echo "::error::PR number is required"
+          exit 1
+        fi
+
+        if [[ -z "$CHECK_NAME" ]]; then
+          echo "::error::check-name is required"
+          exit 1
+        fi
+
+        if [[ "$ACTION" == "add" && -z "$ATTESTATION_ID" ]]; then
+          echo "::error::attestation-id is required for add action"
+          exit 1
+        fi
+
+        max_retries=5
+        retry_delay=1
+
+        for ((attempt = 1; attempt <= max_retries; attempt++)); do
+          echo "::debug::Updating attestation map (attempt $attempt/$max_retries)"
+
+          # Get current PR body
+          body=$(gh pr view "$PR_NUMBER" --json body -q '.body' 2>/dev/null) || {
+            echo "::warning::Failed to fetch PR body, retrying..."
+            sleep "$retry_delay"
+            retry_delay=$((retry_delay * 2))
+            continue
+          }
+
+          # Extract existing map or create new one
+          existing_map=$(echo "$body" | awk '
+            /<!-- ATTESTATION_MAP/,/-->/ {
+              if (!/<!-- ATTESTATION_MAP/ && !/-->/) print
+            }
+          ' | tr -d '\n' | xargs 2>/dev/null || echo "{}")
+
+          if [[ -z "$existing_map" ]] || ! echo "$existing_map" | jq -e . >/dev/null 2>&1; then
+            existing_map='{}'
+          fi
+
+          # Update map based on action
+          if [[ "$ACTION" == "add" ]]; then
+            updated_map=$(echo "$existing_map" | jq -c --arg k "$CHECK_NAME" --arg v "$ATTESTATION_ID" '. + {($k): $v}')
+          elif [[ "$ACTION" == "remove" ]]; then
+            updated_map=$(echo "$existing_map" | jq -c --arg k "$CHECK_NAME" 'del(.[$k])')
+          else
+            echo "::error::Invalid action: $ACTION (must be 'add' or 'remove')"
+            exit 1
+          fi
+
+          # Build new body
+          if echo "$body" | grep -qF "<!-- ATTESTATION_MAP"; then
+            # Replace existing map using awk
+            new_body=$(echo "$body" | awk -v map="$updated_map" '
+              /<!-- ATTESTATION_MAP/,/-->/ {
+                if (/<!-- ATTESTATION_MAP/) {
+                  print "<!-- ATTESTATION_MAP"
+                  print map
+                  next
+                }
+                if (/-->/) {
+                  print "-->"
+                  next
+                }
+                next
+              }
+              { print }
+            ')
+          else
+            # Append new map section
+            new_body="$body
+
+<!-- ATTESTATION_MAP
+$updated_map
+-->"
+          fi
+
+          # Update PR
+          if gh pr edit "$PR_NUMBER" --body "$new_body" 2>/dev/null; then
+            echo "::notice::Updated attestation map: $CHECK_NAME = $ATTESTATION_ID (action: $ACTION)"
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+            echo "map=$updated_map" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::warning::Failed to update PR body, retrying..."
+          sleep "$retry_delay"
+          retry_delay=$((retry_delay * 2))
+        done
+
+        echo "::error::Failed to update attestation map after $max_retries attempts"
+        echo "updated=false" >> "$GITHUB_OUTPUT"
+        echo "map={}" >> "$GITHUB_OUTPUT"
+        exit 1
