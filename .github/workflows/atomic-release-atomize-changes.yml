@@ -184,6 +184,12 @@ jobs:
               attestation_map='{}'
             fi
 
+            # Validate JSON before using jq
+            if ! echo "$attestation_map" | jq empty 2>/dev/null; then
+              echo "::warning::Attestation map is not valid JSON, using empty map"
+              attestation_map='{}'
+            fi
+
             if [[ "$attestation_map" == "{}" ]]; then
               echo "::warning::Source PR #$pr_number has no attestation map"
             else
