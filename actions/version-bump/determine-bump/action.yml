@@ -1,0 +1,188 @@
+name: "Determine Version Bump"
+description: "Analyze conventional commits to determine the appropriate semver bump type"
+author: "aRustyDev"
+
+branding:
+  icon: "git-commit"
+  color: "blue"
+
+inputs:
+  artifact:
+    description: "Artifact name to analyze (e.g., chart name, package name)"
+    required: true
+  artifact-path:
+    description: "Path to artifacts directory (e.g., 'charts', 'packages')"
+    required: true
+  base-ref:
+    description: "Base ref for commit comparison"
+    required: false
+    default: "origin/main"
+  type-mapping:
+    description: |
+      JSON mapping of commit types to bump levels.
+      Default: {"feat": "minor", "fix": "patch", "perf": "patch", "refactor": "patch", "docs": "patch", "style": "patch", "test": "patch", "build": "patch", "ci": "patch", "chore": "patch"}
+    required: false
+    default: '{"feat": "minor", "fix": "patch", "perf": "patch", "refactor": "patch", "docs": "patch", "style": "patch", "test": "patch", "build": "patch", "ci": "patch", "chore": "patch"}'
+  scopes:
+    description: "Comma-separated list of scopes to filter commits (empty = all scopes)"
+    required: false
+    default: ""
+
+outputs:
+  bump-type:
+    description: "Determined bump type: 'major', 'minor', or 'patch'"
+    value: ${{ steps.analyze.outputs.bump-type }}
+  has-breaking:
+    description: "'true' if breaking changes were detected"
+    value: ${{ steps.analyze.outputs.has-breaking }}
+  has-features:
+    description: "'true' if new features were detected"
+    value: ${{ steps.analyze.outputs.has-features }}
+  commit-count:
+    description: "Number of commits analyzed"
+    value: ${{ steps.analyze.outputs.commit-count }}
+  commits-json:
+    description: "JSON array of analyzed commits with type and message"
+    value: ${{ steps.analyze.outputs.commits-json }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Analyze Commits
+      id: analyze
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        ARTIFACT="${{ inputs.artifact }}"
+        ARTIFACT_PATH="${{ inputs.artifact-path }}"
+        BASE_REF="${{ inputs.base-ref }}"
+        TYPE_MAPPING='${{ inputs.type-mapping }}'
+        SCOPES="${{ inputs.scopes }}"
+
+        echo "::group::Analyzing commits for $ARTIFACT"
+        echo "Artifact: $ARTIFACT"
+        echo "Artifact path: $ARTIFACT_PATH"
+        echo "Base ref: $BASE_REF"
+
+        # Build the path to analyze
+        FULL_PATH="$ARTIFACT_PATH/$ARTIFACT"
+
+        # Get commits affecting this artifact since base
+        if ! COMMITS=$(git log --oneline "$BASE_REF"..HEAD -- "$FULL_PATH" 2>/dev/null); then
+          echo "::warning::Failed to get commits, using patch bump"
+          COMMITS=""
+        fi
+
+        COMMIT_COUNT=$(echo "$COMMITS" | grep -c . || echo 0)
+        echo "Found $COMMIT_COUNT commits affecting $FULL_PATH"
+
+        # Initialize flags
+        HAS_BREAKING="false"
+        HAS_FEATURES="false"
+        BUMP_TYPE="patch"
+
+        # Build JSON array of commits
+        COMMITS_JSON="[]"
+        if [[ -n "$COMMITS" ]]; then
+          while IFS= read -r commit_line; do
+            if [[ -z "$commit_line" ]]; then
+              continue
+            fi
+
+            # Extract hash and message
+            HASH=$(echo "$commit_line" | cut -d' ' -f1)
+            MESSAGE=$(echo "$commit_line" | cut -d' ' -f2-)
+
+            # Extract type from conventional commit
+            TYPE=""
+            SCOPE=""
+            BREAKING=""
+
+            if [[ "$MESSAGE" =~ ^([a-z]+)(\(([^)]+)\))?(!)?:\ (.+)$ ]]; then
+              TYPE="${BASH_REMATCH[1]}"
+              SCOPE="${BASH_REMATCH[3]:-}"
+              BREAKING="${BASH_REMATCH[4]:-}"
+            fi
+
+            # Add to JSON array
+            COMMIT_OBJ=$(jq -n \
+              --arg hash "$HASH" \
+              --arg message "$MESSAGE" \
+              --arg type "$TYPE" \
+              --arg scope "$SCOPE" \
+              --arg breaking "$BREAKING" \
+              '{hash: $hash, message: $message, type: $type, scope: $scope, breaking: ($breaking != "")}'
+            )
+            COMMITS_JSON=$(echo "$COMMITS_JSON" | jq --argjson obj "$COMMIT_OBJ" '. + [$obj]')
+          done <<< "$COMMITS"
+        fi
+
+        # Check for breaking changes (major bump)
+        # Pattern 1: "!" before colon (e.g., "feat!:" or "fix(scope)!:")
+        # Pattern 2: "BREAKING CHANGE" or "BREAKING-CHANGE" in body/footer
+        if echo "$COMMITS" | grep -qiE '(BREAKING[ -]CHANGE|!:)'; then
+          HAS_BREAKING="true"
+          BUMP_TYPE="major"
+          echo "::notice::Breaking change detected - major bump required"
+        fi
+
+        # Check for features (minor bump) if not already major
+        if [[ "$BUMP_TYPE" != "major" ]]; then
+          if echo "$COMMITS" | grep -qE '^[a-f0-9]+ feat'; then
+            HAS_FEATURES="true"
+            BUMP_TYPE="minor"
+            echo "::notice::New feature detected - minor bump required"
+          fi
+        fi
+
+        # If still patch, check for any recognized type
+        if [[ "$BUMP_TYPE" == "patch" && -n "$COMMITS" ]]; then
+          # Parse type mapping to find highest bump level
+          HIGHEST_BUMP="patch"
+          while IFS= read -r commit_line; do
+            if [[ -z "$commit_line" ]]; then
+              continue
+            fi
+            MESSAGE=$(echo "$commit_line" | cut -d' ' -f2-)
+
+            # Extract type
+            if [[ "$MESSAGE" =~ ^([a-z]+)(\([^)]+\))?!?:\ .+$ ]]; then
+              COMMIT_TYPE="${BASH_REMATCH[1]}"
+
+              # Look up bump level for this type
+              LEVEL=$(echo "$TYPE_MAPPING" | jq -r --arg type "$COMMIT_TYPE" '.[$type] // "patch"')
+
+              # Update highest bump if needed
+              if [[ "$LEVEL" == "minor" && "$HIGHEST_BUMP" == "patch" ]]; then
+                HIGHEST_BUMP="minor"
+              elif [[ "$LEVEL" == "major" ]]; then
+                HIGHEST_BUMP="major"
+              fi
+            fi
+          done <<< "$COMMITS"
+          BUMP_TYPE="$HIGHEST_BUMP"
+        fi
+
+        # Default to patch if no commits
+        if [[ -z "$COMMITS" ]]; then
+          echo "::notice::No commits found - defaulting to patch bump"
+          BUMP_TYPE="patch"
+        fi
+
+        echo "::endgroup::"
+
+        # Set outputs
+        echo "bump-type=$BUMP_TYPE" >> "$GITHUB_OUTPUT"
+        echo "has-breaking=$HAS_BREAKING" >> "$GITHUB_OUTPUT"
+        echo "has-features=$HAS_FEATURES" >> "$GITHUB_OUTPUT"
+        echo "commit-count=$COMMIT_COUNT" >> "$GITHUB_OUTPUT"
+
+        # Handle multi-line JSON output
+        {
+          echo "commits-json<<EOF"
+          echo "$COMMITS_JSON"
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+
+        echo "::notice::Determined bump type: $BUMP_TYPE (commits: $COMMIT_COUNT, breaking: $HAS_BREAKING, features: $HAS_FEATURES)"
