@@ -1,0 +1,195 @@
+name: "Calculate Version"
+description: "Calculate the next semantic version based on current version and bump type"
+author: "aRustyDev"
+
+branding:
+  icon: "hash"
+  color: "green"
+
+inputs:
+  current-version:
+    description: "Current semver version (e.g., '1.2.3' or 'v1.2.3')"
+    required: true
+  bump-type:
+    description: "Bump type: 'major', 'minor', or 'patch'"
+    required: true
+  pre-release:
+    description: "Pre-release identifier (e.g., 'alpha', 'beta', 'rc'). Leave empty for stable releases."
+    required: false
+    default: ""
+  pre-release-bump:
+    description: "How to handle pre-release versions: 'increment' (bump pre-release number), 'promote' (remove pre-release), 'new' (start new pre-release)"
+    required: false
+    default: "new"
+  build-metadata:
+    description: "Build metadata to append (e.g., 'build.123'). Will be appended after '+'"
+    required: false
+    default: ""
+
+outputs:
+  next-version:
+    description: "Calculated next version (without 'v' prefix)"
+    value: ${{ steps.calculate.outputs.next-version }}
+  major:
+    description: "Major version component"
+    value: ${{ steps.calculate.outputs.major }}
+  minor:
+    description: "Minor version component"
+    value: ${{ steps.calculate.outputs.minor }}
+  patch:
+    description: "Patch version component"
+    value: ${{ steps.calculate.outputs.patch }}
+  is-pre-release:
+    description: "'true' if the version is a pre-release"
+    value: ${{ steps.calculate.outputs.is-pre-release }}
+  pre-release-id:
+    description: "Pre-release identifier (e.g., 'alpha.1')"
+    value: ${{ steps.calculate.outputs.pre-release-id }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Calculate Next Version
+      id: calculate
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        CURRENT_VERSION="${{ inputs.current-version }}"
+        BUMP_TYPE="${{ inputs.bump-type }}"
+        PRE_RELEASE="${{ inputs.pre-release }}"
+        PRE_RELEASE_BUMP="${{ inputs.pre-release-bump }}"
+        BUILD_METADATA="${{ inputs.build-metadata }}"
+
+        echo "::group::Calculating next version"
+        echo "Current version: $CURRENT_VERSION"
+        echo "Bump type: $BUMP_TYPE"
+        echo "Pre-release: $PRE_RELEASE"
+        echo "Pre-release bump: $PRE_RELEASE_BUMP"
+        echo "Build metadata: $BUILD_METADATA"
+
+        # Validate bump type
+        case "$BUMP_TYPE" in
+          major|minor|patch)
+            ;;
+          *)
+            echo "::error::Invalid bump type: $BUMP_TYPE. Must be 'major', 'minor', or 'patch'."
+            exit 1
+            ;;
+        esac
+
+        # Remove leading 'v' if present
+        CURRENT_VERSION="${CURRENT_VERSION#v}"
+
+        # Remove build metadata (everything after +)
+        CURRENT_VERSION="${CURRENT_VERSION%%+*}"
+
+        # Extract pre-release suffix and base version
+        CURRENT_PRE_RELEASE=""
+        BASE_VERSION="$CURRENT_VERSION"
+        if [[ "$CURRENT_VERSION" == *-* ]]; then
+          BASE_VERSION="${CURRENT_VERSION%%-*}"
+          CURRENT_PRE_RELEASE="${CURRENT_VERSION#*-}"
+        fi
+
+        # Parse base version components
+        if ! [[ "$BASE_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+          echo "::error::Invalid version format: $BASE_VERSION. Expected X.Y.Z"
+          exit 1
+        fi
+
+        MAJOR="${BASH_REMATCH[1]}"
+        MINOR="${BASH_REMATCH[2]}"
+        PATCH="${BASH_REMATCH[3]}"
+
+        echo "Parsed: major=$MAJOR, minor=$MINOR, patch=$PATCH, pre-release=$CURRENT_PRE_RELEASE"
+
+        # Handle pre-release version bumping
+        NEW_PRE_RELEASE=""
+        IS_PRE_RELEASE="false"
+
+        if [[ -n "$CURRENT_PRE_RELEASE" && "$PRE_RELEASE_BUMP" == "increment" && -n "$PRE_RELEASE" ]]; then
+          # Increment existing pre-release
+          # Extract the numeric part from current pre-release
+          if [[ "$CURRENT_PRE_RELEASE" =~ ^([a-z]+)\.([0-9]+)$ ]]; then
+            CURRENT_PRE_ID="${BASH_REMATCH[1]}"
+            CURRENT_PRE_NUM="${BASH_REMATCH[2]}"
+            if [[ "$CURRENT_PRE_ID" == "$PRE_RELEASE" ]]; then
+              NEW_PRE_RELEASE="$PRE_RELEASE.$((CURRENT_PRE_NUM + 1))"
+              IS_PRE_RELEASE="true"
+              echo "Incrementing pre-release: $CURRENT_PRE_RELEASE -> $NEW_PRE_RELEASE"
+            else
+              # Different pre-release type, start new
+              NEW_PRE_RELEASE="$PRE_RELEASE.1"
+              IS_PRE_RELEASE="true"
+              echo "New pre-release type: $NEW_PRE_RELEASE"
+            fi
+          else
+            # Can't parse, start new
+            NEW_PRE_RELEASE="$PRE_RELEASE.1"
+            IS_PRE_RELEASE="true"
+          fi
+        elif [[ -n "$CURRENT_PRE_RELEASE" && "$PRE_RELEASE_BUMP" == "promote" ]]; then
+          # Promote to stable - no version bump needed, just remove pre-release
+          NEW_PRE_RELEASE=""
+          IS_PRE_RELEASE="false"
+          echo "Promoting to stable release"
+        elif [[ -n "$PRE_RELEASE" ]]; then
+          # Start new pre-release or apply pre-release to bumped version
+          # First, bump the version
+          case "$BUMP_TYPE" in
+            major)
+              MAJOR=$((MAJOR + 1))
+              MINOR=0
+              PATCH=0
+              ;;
+            minor)
+              MINOR=$((MINOR + 1))
+              PATCH=0
+              ;;
+            patch)
+              PATCH=$((PATCH + 1))
+              ;;
+          esac
+          NEW_PRE_RELEASE="$PRE_RELEASE.1"
+          IS_PRE_RELEASE="true"
+          echo "Starting new pre-release: $NEW_PRE_RELEASE"
+        else
+          # Standard bump - no pre-release
+          case "$BUMP_TYPE" in
+            major)
+              MAJOR=$((MAJOR + 1))
+              MINOR=0
+              PATCH=0
+              ;;
+            minor)
+              MINOR=$((MINOR + 1))
+              PATCH=0
+              ;;
+            patch)
+              PATCH=$((PATCH + 1))
+              ;;
+          esac
+          echo "Standard bump: $BUMP_TYPE"
+        fi
+
+        # Construct next version
+        NEXT_VERSION="$MAJOR.$MINOR.$PATCH"
+        if [[ -n "$NEW_PRE_RELEASE" ]]; then
+          NEXT_VERSION="$NEXT_VERSION-$NEW_PRE_RELEASE"
+        fi
+        if [[ -n "$BUILD_METADATA" ]]; then
+          NEXT_VERSION="$NEXT_VERSION+$BUILD_METADATA"
+        fi
+
+        echo "::endgroup::"
+
+        # Set outputs
+        echo "next-version=$NEXT_VERSION" >> "$GITHUB_OUTPUT"
+        echo "major=$MAJOR" >> "$GITHUB_OUTPUT"
+        echo "minor=$MINOR" >> "$GITHUB_OUTPUT"
+        echo "patch=$PATCH" >> "$GITHUB_OUTPUT"
+        echo "is-pre-release=$IS_PRE_RELEASE" >> "$GITHUB_OUTPUT"
+        echo "pre-release-id=$NEW_PRE_RELEASE" >> "$GITHUB_OUTPUT"
+
+        echo "::notice::Calculated next version: $NEXT_VERSION (from $CURRENT_VERSION via $BUMP_TYPE bump)"
