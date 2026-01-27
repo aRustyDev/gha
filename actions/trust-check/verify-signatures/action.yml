@@ -1,5 +1,5 @@
 name: "Verify Commit Signatures"
-description: "Verify GPG/SSH commit signatures in a commit range"
+description: "Verify GPG/SSH commit signatures in a commit range using GitHub API"
 author: "aRustyDev"
 
 branding:
@@ -23,6 +23,10 @@ inputs:
     description: "Accept GitHub's web-flow signature (commits made via GitHub UI)"
     required: false
     default: "true"
+  token:
+    description: "GitHub token for API access"
+    required: false
+    default: ${{ github.token }}
 
 outputs:
   all-signed:
@@ -37,6 +41,9 @@ outputs:
   unsigned-commits:
     description: "Comma-separated list of unsigned commit SHAs"
     value: ${{ steps.verify.outputs.unsigned-commits }}
+  results-json:
+    description: "JSON array of verification results per commit"
+    value: ${{ steps.verify.outputs.results-json }}
 
 runs:
   using: "composite"
@@ -45,27 +52,29 @@ runs:
       id: verify
       shell: bash
       env:
+        GH_TOKEN: ${{ inputs.token }}
         COMMIT_RANGE: ${{ inputs.commit-range }}
         REQUIRE_ALL: ${{ inputs.require-all }}
         ALLOWED_KEYS: ${{ inputs.allowed-keys }}
         VERIFY_GITHUB: ${{ inputs.verify-github }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
       run: |
         set -euo pipefail
 
-        echo "::group::Verifying commit signatures"
+        echo "::group::Verifying commit signatures via GitHub API"
         echo "Commit range: $COMMIT_RANGE"
         echo "Require all signed: $REQUIRE_ALL"
         echo "Verify GitHub signatures: $VERIFY_GITHUB"
+        echo "Repository: $GITHUB_REPOSITORY"
 
         # GitHub's web-flow GPG key fingerprints
-        # See: https://docs.github.com/en/authentication/managing-commit-signature-verification/about-commit-signature-verification
-        GITHUB_WEB_FLOW_KEY="4AEE18F83AFDEB23"
-        GITHUB_WEB_FLOW_KEY_NOREPLY="B5690EEEBB952194"
+        GITHUB_WEB_FLOW_KEYS="4AEE18F83AFDEB23,B5690EEEBB952194"
 
         signed_count=0
         unsigned_count=0
         unsigned_commits=""
         all_signed="true"
+        results_json="[]"
 
         # Get list of commits in range
         commits=$(git rev-list "$COMMIT_RANGE" 2>/dev/null || echo "")
@@ -76,6 +85,7 @@ runs:
           echo "signed-count=0" >> "$GITHUB_OUTPUT"
           echo "unsigned-count=0" >> "$GITHUB_OUTPUT"
           echo "unsigned-commits=" >> "$GITHUB_OUTPUT"
+          echo "results-json=[]" >> "$GITHUB_OUTPUT"
           echo "::endgroup::"
           exit 0
         fi
@@ -87,82 +97,176 @@ runs:
         # Parse allowed keys into array
         IFS=',' read -ra allowed_keys_array <<< "$ALLOWED_KEYS"
 
-        # Verify each commit
+        # Verify each commit using GitHub API
         for commit in $commits; do
           short_sha="${commit:0:7}"
           echo "---"
           echo "Checking commit: $short_sha"
 
-          # Get commit info
-          commit_author=$(git log -1 --format="%an <%ae>" "$commit")
-          commit_subject=$(git log -1 --format="%s" "$commit")
-          echo "Author: $commit_author"
-          echo "Subject: $commit_subject"
+          # Query GitHub API for commit verification status
+          api_response=$(gh api "/repos/$GITHUB_REPOSITORY/commits/$commit" \
+            --jq '{
+              verified: .commit.verification.verified,
+              reason: .commit.verification.reason,
+              signature: .commit.verification.signature,
+              payload: .commit.verification.payload,
+              author: .commit.author.name,
+              message: .commit.message
+            }' 2>/dev/null) || {
+            echo "::warning::Failed to query API for commit $short_sha"
+            api_response='{"verified": false, "reason": "api_error"}'
+          }
 
-          # Try to verify the commit signature
-          sig_status=""
+          verified=$(echo "$api_response" | jq -r '.verified // false')
+          reason=$(echo "$api_response" | jq -r '.reason // "unknown"')
+          author=$(echo "$api_response" | jq -r '.author // "unknown"')
+          message=$(echo "$api_response" | jq -r '.message // ""' | head -1)
+
+          echo "Author: $author"
+          echo "Message: $message"
+          echo "Verified: $verified"
+          echo "Reason: $reason"
+
+          # Determine signature status
+          sig_status="unsigned"
           key_id=""
 
-          # Use git verify-commit and capture output
-          verify_output=$(git verify-commit "$commit" 2>&1 || true)
-
-          if echo "$verify_output" | grep -qE "(Good signature|Signature made)"; then
-            sig_status="good"
-
-            # Extract key ID from verification output
-            key_id=$(echo "$verify_output" | grep -oE 'key (ID )?[A-F0-9]+' | grep -oE '[A-F0-9]+' | head -1 || true)
-
-            # Check if this is a GitHub web-flow signature
-            if [[ "$key_id" == "$GITHUB_WEB_FLOW_KEY" || "$key_id" == "$GITHUB_WEB_FLOW_KEY_NOREPLY" ]]; then
-              if [[ "$VERIFY_GITHUB" == "true" ]]; then
-                echo "::notice::Commit $short_sha: Signed with GitHub web-flow key"
-                ((signed_count++))
-              else
-                echo "::warning::Commit $short_sha: GitHub web-flow signature not accepted"
-                sig_status="rejected"
-              fi
-            elif [[ -n "$ALLOWED_KEYS" ]]; then
-              # Check if key is in allowed list
-              key_allowed="false"
-              for allowed_key in "${allowed_keys_array[@]}"; do
-                allowed_key=$(echo "$allowed_key" | xargs)  # Trim whitespace
-                if [[ "$key_id" == *"$allowed_key"* ]]; then
-                  key_allowed="true"
-                  break
+          if [[ "$verified" == "true" ]]; then
+            # Check the verification reason
+            case "$reason" in
+              valid)
+                # Extract key ID from signature if present
+                signature=$(echo "$api_response" | jq -r '.signature // ""')
+                if [[ -n "$signature" ]]; then
+                  # Try to extract key ID from signature header
+                  key_id=$(echo "$signature" | grep -oE 'keyid [A-F0-9]+' | cut -d' ' -f2 || true)
+                  if [[ -z "$key_id" ]]; then
+                    # Try alternate format
+                    key_id=$(echo "$signature" | head -20 | grep -oE '[A-F0-9]{16}' | head -1 || true)
+                  fi
                 fi
-              done
 
-              if [[ "$key_allowed" == "true" ]]; then
-                echo "::notice::Commit $short_sha: Signed with allowed key $key_id"
+                # Check if this is a GitHub web-flow signature
+                is_github_webflow="false"
+                if [[ -n "$key_id" ]]; then
+                  for gh_key in ${GITHUB_WEB_FLOW_KEYS//,/ }; do
+                    if [[ "$key_id" == *"$gh_key"* ]]; then
+                      is_github_webflow="true"
+                      break
+                    fi
+                  done
+                fi
+
+                if [[ "$is_github_webflow" == "true" ]]; then
+                  if [[ "$VERIFY_GITHUB" == "true" ]]; then
+                    echo "::notice::Commit $short_sha: Verified (GitHub web-flow)"
+                    sig_status="good"
+                    ((signed_count++))
+                  else
+                    echo "::warning::Commit $short_sha: GitHub web-flow signature not accepted"
+                    sig_status="rejected"
+                  fi
+                elif [[ -n "$ALLOWED_KEYS" && -n "$key_id" ]]; then
+                  # Check if key is in allowed list
+                  key_allowed="false"
+                  for allowed_key in "${allowed_keys_array[@]}"; do
+                    allowed_key=$(echo "$allowed_key" | xargs)
+                    if [[ -n "$allowed_key" && "$key_id" == *"$allowed_key"* ]]; then
+                      key_allowed="true"
+                      break
+                    fi
+                  done
+
+                  if [[ "$key_allowed" == "true" ]]; then
+                    echo "::notice::Commit $short_sha: Verified with allowed key $key_id"
+                    sig_status="good"
+                    ((signed_count++))
+                  else
+                    echo "::warning::Commit $short_sha: Signed with non-allowed key $key_id"
+                    sig_status="rejected"
+                  fi
+                else
+                  # Valid signature, no key restrictions
+                  echo "::notice::Commit $short_sha: Verified ($reason)"
+                  sig_status="good"
+                  ((signed_count++))
+                fi
+                ;;
+
+              *)
+                # Other valid reasons (shouldn't happen if verified=true, but handle it)
+                echo "::notice::Commit $short_sha: Verified ($reason)"
+                sig_status="good"
                 ((signed_count++))
-              else
-                echo "::warning::Commit $short_sha: Signed with non-allowed key $key_id"
-                sig_status="rejected"
-              fi
-            else
-              echo "::notice::Commit $short_sha: Valid signature (key: $key_id)"
-              ((signed_count++))
-            fi
-          elif echo "$verify_output" | grep -q "No signature"; then
-            sig_status="unsigned"
-            echo "::warning::Commit $short_sha: No signature found"
+                ;;
+            esac
           else
-            sig_status="invalid"
-            echo "::warning::Commit $short_sha: Invalid or unverifiable signature"
+            # Not verified - check the reason
+            case "$reason" in
+              unsigned)
+                echo "::warning::Commit $short_sha: No signature"
+                sig_status="unsigned"
+                ;;
+              unverified_email)
+                echo "::warning::Commit $short_sha: Unverified email"
+                sig_status="unverified"
+                ;;
+              bad_email)
+                echo "::warning::Commit $short_sha: Email mismatch"
+                sig_status="invalid"
+                ;;
+              unknown_key)
+                echo "::warning::Commit $short_sha: Unknown signing key"
+                sig_status="unknown_key"
+                ;;
+              malformed_signature)
+                echo "::warning::Commit $short_sha: Malformed signature"
+                sig_status="invalid"
+                ;;
+              invalid)
+                echo "::warning::Commit $short_sha: Invalid signature"
+                sig_status="invalid"
+                ;;
+              expired_key)
+                echo "::warning::Commit $short_sha: Expired signing key"
+                sig_status="expired"
+                ;;
+              not_signing_key)
+                echo "::warning::Commit $short_sha: Key not authorized for signing"
+                sig_status="invalid"
+                ;;
+              gpgverify_error|gpgverify_unavailable)
+                echo "::warning::Commit $short_sha: GPG verification unavailable"
+                sig_status="error"
+                ;;
+              *)
+                echo "::warning::Commit $short_sha: Verification failed ($reason)"
+                sig_status="failed"
+                ;;
+            esac
           fi
 
-          # Handle unsigned/rejected commits
-          if [[ "$sig_status" != "good" ]] || [[ "$sig_status" == "rejected" ]]; then
-            if [[ "$sig_status" == "unsigned" || "$sig_status" == "invalid" || "$sig_status" == "rejected" ]]; then
-              ((unsigned_count++))
-              all_signed="false"
-              if [[ -z "$unsigned_commits" ]]; then
-                unsigned_commits="$short_sha"
-              else
-                unsigned_commits="$unsigned_commits,$short_sha"
-              fi
+          # Track unsigned/rejected commits
+          if [[ "$sig_status" != "good" ]]; then
+            ((unsigned_count++))
+            all_signed="false"
+            if [[ -z "$unsigned_commits" ]]; then
+              unsigned_commits="$short_sha"
+            else
+              unsigned_commits="$unsigned_commits,$short_sha"
             fi
           fi
+
+          # Add to results JSON
+          result_obj=$(jq -n \
+            --arg sha "$short_sha" \
+            --arg full_sha "$commit" \
+            --arg status "$sig_status" \
+            --arg reason "$reason" \
+            --arg key_id "$key_id" \
+            --argjson verified "$verified" \
+            '{sha: $sha, full_sha: $full_sha, status: $status, reason: $reason, key_id: $key_id, verified: $verified}')
+          results_json=$(echo "$results_json" | jq --argjson obj "$result_obj" '. + [$obj]')
         done
 
         echo "---"
@@ -172,7 +276,7 @@ runs:
         echo "::notice::Signature verification complete: $signed_count/$total_commits signed"
 
         if [[ "$all_signed" != "true" ]]; then
-          echo "::warning::Unsigned commits: $unsigned_commits"
+          echo "::warning::Unsigned/unverified commits: $unsigned_commits"
         fi
 
         # Set outputs
@@ -180,6 +284,13 @@ runs:
         echo "signed-count=$signed_count" >> "$GITHUB_OUTPUT"
         echo "unsigned-count=$unsigned_count" >> "$GITHUB_OUTPUT"
         echo "unsigned-commits=$unsigned_commits" >> "$GITHUB_OUTPUT"
+
+        # Output results JSON
+        {
+          echo "results-json<<EOF"
+          echo "$results_json"
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
 
         # Fail if required and not all signed
         if [[ "$REQUIRE_ALL" == "true" && "$all_signed" != "true" ]]; then
