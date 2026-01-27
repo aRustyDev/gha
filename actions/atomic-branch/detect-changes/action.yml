@@ -1,0 +1,225 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-action.json
+name: "Detect Changed Artifacts"
+description: "Detect changed artifacts in a commit range for atomic branch processing"
+author: "aRustyDev"
+
+branding:
+  icon: "git-branch"
+  color: "blue"
+
+inputs:
+  artifact-path:
+    description: 'Path to artifacts directory (e.g., "charts", "crates")'
+    required: true
+  manifest-file:
+    description: 'Manifest file within each artifact (e.g., "Chart.yaml", "Cargo.toml")'
+    required: true
+  target-branch:
+    description: "Branch to compare against"
+    required: false
+    default: "main"
+  commit-range:
+    description: "Explicit commit range (overrides target-branch comparison)"
+    required: false
+    default: ""
+  ignore-patterns:
+    description: "Patterns to ignore (space-separated globs)"
+    required: false
+    default: ""
+
+outputs:
+  artifacts:
+    description: "Space-separated list of changed artifact names"
+    value: ${{ steps.detect.outputs.artifacts }}
+  artifacts-json:
+    description: "JSON array of changed artifacts (for matrix)"
+    value: ${{ steps.detect.outputs.artifacts_json }}
+  count:
+    description: "Number of changed artifacts"
+    value: ${{ steps.detect.outputs.count }}
+  new-artifacts:
+    description: "Space-separated list of new artifact names"
+    value: ${{ steps.detect.outputs.new_artifacts }}
+  new-artifacts-json:
+    description: "JSON array of new artifacts"
+    value: ${{ steps.detect.outputs.new_artifacts_json }}
+  modified-artifacts:
+    description: "Space-separated list of modified artifact names"
+    value: ${{ steps.detect.outputs.modified_artifacts }}
+  modified-artifacts-json:
+    description: "JSON array of modified artifacts"
+    value: ${{ steps.detect.outputs.modified_artifacts_json }}
+  deleted-artifacts:
+    description: "Space-separated list of deleted artifact names"
+    value: ${{ steps.detect.outputs.deleted_artifacts }}
+  deleted-artifacts-json:
+    description: "JSON array of deleted artifacts"
+    value: ${{ steps.detect.outputs.deleted_artifacts_json }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Detect changed artifacts
+      id: detect
+      shell: bash
+      env:
+        ARTIFACT_PATH: ${{ inputs.artifact-path }}
+        MANIFEST_FILE: ${{ inputs.manifest-file }}
+        TARGET_BRANCH: ${{ inputs.target-branch }}
+        COMMIT_RANGE: ${{ inputs.commit-range }}
+        IGNORE_PATTERNS: ${{ inputs.ignore-patterns }}
+      run: |
+        set -euo pipefail
+
+        # Determine commit range
+        if [[ -n "$COMMIT_RANGE" ]]; then
+          RANGE="$COMMIT_RANGE"
+          echo "::notice::Using explicit commit range: $RANGE"
+        else
+          RANGE="origin/${TARGET_BRANCH}..HEAD"
+          echo "::notice::Comparing against target branch: $RANGE"
+        fi
+
+        # Validate that the range is valid
+        if ! git rev-parse "${RANGE%%..*}" >/dev/null 2>&1; then
+          echo "::error::Invalid commit range: $RANGE"
+          exit 1
+        fi
+
+        # Get all changed files
+        CHANGED_FILES=$(git diff --name-only "$RANGE" 2>/dev/null || true)
+
+        if [[ -z "$CHANGED_FILES" ]]; then
+          echo "::notice::No changed files detected in range: $RANGE"
+          echo "artifacts=" >> "$GITHUB_OUTPUT"
+          echo "artifacts_json=[]" >> "$GITHUB_OUTPUT"
+          echo "count=0" >> "$GITHUB_OUTPUT"
+          echo "new_artifacts=" >> "$GITHUB_OUTPUT"
+          echo "new_artifacts_json=[]" >> "$GITHUB_OUTPUT"
+          echo "modified_artifacts=" >> "$GITHUB_OUTPUT"
+          echo "modified_artifacts_json=[]" >> "$GITHUB_OUTPUT"
+          echo "deleted_artifacts=" >> "$GITHUB_OUTPUT"
+          echo "deleted_artifacts_json=[]" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Filter to artifact path and extract unique artifact names
+        ARTIFACT_DIRS=$(echo "$CHANGED_FILES" | grep "^${ARTIFACT_PATH}/" | cut -d'/' -f2 | sort -u || true)
+
+        if [[ -z "$ARTIFACT_DIRS" ]]; then
+          echo "::notice::No artifact changes detected in ${ARTIFACT_PATH}/"
+          echo "artifacts=" >> "$GITHUB_OUTPUT"
+          echo "artifacts_json=[]" >> "$GITHUB_OUTPUT"
+          echo "count=0" >> "$GITHUB_OUTPUT"
+          echo "new_artifacts=" >> "$GITHUB_OUTPUT"
+          echo "new_artifacts_json=[]" >> "$GITHUB_OUTPUT"
+          echo "modified_artifacts=" >> "$GITHUB_OUTPUT"
+          echo "modified_artifacts_json=[]" >> "$GITHUB_OUTPUT"
+          echo "deleted_artifacts=" >> "$GITHUB_OUTPUT"
+          echo "deleted_artifacts_json=[]" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Initialize arrays
+        ALL_ARTIFACTS=""
+        NEW_ARTIFACTS=""
+        MODIFIED_ARTIFACTS=""
+        DELETED_ARTIFACTS=""
+
+        # Process each potential artifact
+        for dir in $ARTIFACT_DIRS; do
+          # Apply ignore patterns
+          SKIP=false
+          if [[ -n "$IGNORE_PATTERNS" ]]; then
+            for pattern in $IGNORE_PATTERNS; do
+              # shellcheck disable=SC2053
+              if [[ "$dir" == $pattern ]]; then
+                echo "::notice::Skipping $dir - matches ignore pattern: $pattern"
+                SKIP=true
+                break
+              fi
+            done
+          fi
+
+          if [[ "$SKIP" == "true" ]]; then
+            continue
+          fi
+
+          # Check artifact status
+          MANIFEST_PATH="${ARTIFACT_PATH}/${dir}/${MANIFEST_FILE}"
+
+          # Check if manifest exists in current HEAD
+          if git show "HEAD:${MANIFEST_PATH}" >/dev/null 2>&1; then
+            # Manifest exists now - check if it existed before
+            if git show "${RANGE%%..*}:${MANIFEST_PATH}" >/dev/null 2>&1; then
+              # Existed before -> Modified
+              MODIFIED_ARTIFACTS="$MODIFIED_ARTIFACTS $dir"
+              echo "::notice::Modified artifact: $dir"
+            else
+              # Did not exist before -> New
+              NEW_ARTIFACTS="$NEW_ARTIFACTS $dir"
+              echo "::notice::New artifact: $dir"
+            fi
+            ALL_ARTIFACTS="$ALL_ARTIFACTS $dir"
+          else
+            # Manifest does not exist now - check if it existed before
+            if git show "${RANGE%%..*}:${MANIFEST_PATH}" >/dev/null 2>&1; then
+              # Existed before but not now -> Deleted
+              DELETED_ARTIFACTS="$DELETED_ARTIFACTS $dir"
+              echo "::notice::Deleted artifact: $dir"
+            else
+              echo "::notice::Skipping $dir - no $MANIFEST_FILE found (not a valid artifact)"
+            fi
+          fi
+        done
+
+        # Trim whitespace
+        ALL_ARTIFACTS=$(echo "$ALL_ARTIFACTS" | xargs)
+        NEW_ARTIFACTS=$(echo "$NEW_ARTIFACTS" | xargs)
+        MODIFIED_ARTIFACTS=$(echo "$MODIFIED_ARTIFACTS" | xargs)
+        DELETED_ARTIFACTS=$(echo "$DELETED_ARTIFACTS" | xargs)
+
+        # Count artifacts
+        if [[ -n "$ALL_ARTIFACTS" ]]; then
+          COUNT=$(echo "$ALL_ARTIFACTS" | wc -w | xargs)
+        else
+          COUNT=0
+        fi
+
+        # Convert to JSON arrays
+        to_json_array() {
+          local input="$1"
+          if [[ -z "$input" ]]; then
+            echo "[]"
+          else
+            echo "$input" | tr ' ' '\n' | jq -R -s -c 'split("\n") | map(select(length > 0))'
+          fi
+        }
+
+        ALL_ARTIFACTS_JSON=$(to_json_array "$ALL_ARTIFACTS")
+        NEW_ARTIFACTS_JSON=$(to_json_array "$NEW_ARTIFACTS")
+        MODIFIED_ARTIFACTS_JSON=$(to_json_array "$MODIFIED_ARTIFACTS")
+        DELETED_ARTIFACTS_JSON=$(to_json_array "$DELETED_ARTIFACTS")
+
+        # Set outputs
+        echo "artifacts=$ALL_ARTIFACTS" >> "$GITHUB_OUTPUT"
+        echo "artifacts_json=$ALL_ARTIFACTS_JSON" >> "$GITHUB_OUTPUT"
+        echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+        echo "new_artifacts=$NEW_ARTIFACTS" >> "$GITHUB_OUTPUT"
+        echo "new_artifacts_json=$NEW_ARTIFACTS_JSON" >> "$GITHUB_OUTPUT"
+        echo "modified_artifacts=$MODIFIED_ARTIFACTS" >> "$GITHUB_OUTPUT"
+        echo "modified_artifacts_json=$MODIFIED_ARTIFACTS_JSON" >> "$GITHUB_OUTPUT"
+        echo "deleted_artifacts=$DELETED_ARTIFACTS" >> "$GITHUB_OUTPUT"
+        echo "deleted_artifacts_json=$DELETED_ARTIFACTS_JSON" >> "$GITHUB_OUTPUT"
+
+        # Summary
+        echo "::notice::Changed artifacts ($COUNT): $ALL_ARTIFACTS"
+        if [[ -n "$NEW_ARTIFACTS" ]]; then
+          echo "::notice::New: $NEW_ARTIFACTS"
+        fi
+        if [[ -n "$MODIFIED_ARTIFACTS" ]]; then
+          echo "::notice::Modified: $MODIFIED_ARTIFACTS"
+        fi
+        if [[ -n "$DELETED_ARTIFACTS" ]]; then
+          echo "::notice::Deleted: $DELETED_ARTIFACTS"
+        fi
