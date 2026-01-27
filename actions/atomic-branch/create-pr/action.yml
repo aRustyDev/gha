@@ -1,0 +1,309 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-action.json
+name: "Create Artifact PR"
+description: "Create or update a PR with attestation lineage for atomic release processing"
+author: "aRustyDev"
+
+branding:
+  icon: "git-pull-request"
+  color: "purple"
+
+inputs:
+  artifact:
+    description: "Artifact name"
+    required: true
+  branch:
+    description: "Source branch for PR"
+    required: true
+  target-branch:
+    description: "Target branch for PR"
+    required: false
+    default: "main"
+  source-pr:
+    description: "Source PR number (for lineage tracking)"
+    required: false
+    default: ""
+  attestation-map:
+    description: "JSON attestation map to carry forward"
+    required: false
+    default: "{}"
+  source-branch:
+    description: "Original source branch name (e.g., integration)"
+    required: false
+    default: "integration"
+  commit-sha:
+    description: "Source commit SHA for reference"
+    required: false
+    default: ""
+  labels:
+    description: "Comma-separated list of labels to add"
+    required: false
+    default: ""
+  reviewers:
+    description: "Comma-separated list of reviewers to request"
+    required: false
+    default: ""
+  team-reviewers:
+    description: "Comma-separated list of team reviewers to request"
+    required: false
+    default: ""
+  draft:
+    description: "Create PR as draft"
+    required: false
+    default: "false"
+  token:
+    description: "GitHub token for API operations"
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  pr-number:
+    description: "PR number (new or existing)"
+    value: ${{ steps.pr.outputs.pr_number }}
+  pr-action:
+    description: "Action taken: created, updated, or unchanged"
+    value: ${{ steps.pr.outputs.pr_action }}
+  pr-url:
+    description: "Full PR URL"
+    value: ${{ steps.pr.outputs.pr_url }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Create/update PR
+      id: pr
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        ARTIFACT: ${{ inputs.artifact }}
+        BRANCH: ${{ inputs.branch }}
+        TARGET_BRANCH: ${{ inputs.target-branch }}
+        SOURCE_PR: ${{ inputs.source-pr }}
+        ATTESTATION_MAP: ${{ inputs.attestation-map }}
+        COMMIT_SHA: ${{ inputs.commit-sha }}
+        SOURCE_BRANCH: ${{ inputs.source-branch }}
+        LABELS: ${{ inputs.labels }}
+        REVIEWERS: ${{ inputs.reviewers }}
+        TEAM_REVIEWERS: ${{ inputs.team-reviewers }}
+        DRAFT: ${{ inputs.draft }}
+        GITHUB_SHA: ${{ github.sha }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+
+        # Use provided commit SHA or fall back to GITHUB_SHA
+        if [[ -z "$COMMIT_SHA" ]]; then
+          COMMIT_SHA="$GITHUB_SHA"
+        fi
+
+        echo "::group::PR operations for $ARTIFACT"
+        echo "Branch: $BRANCH"
+        echo "Target: $TARGET_BRANCH"
+        echo "Source PR: ${SOURCE_PR:-none}"
+
+        # Validate attestation map is valid JSON
+        if [[ -n "$ATTESTATION_MAP" && "$ATTESTATION_MAP" != "{}" ]]; then
+          if ! echo "$ATTESTATION_MAP" | jq -e . >/dev/null 2>&1; then
+            echo "::warning::Invalid attestation map JSON, using empty map"
+            ATTESTATION_MAP="{}"
+          fi
+        fi
+
+        # Check for existing PR
+        EXISTING_PR=$(gh pr list \
+          --head "$BRANCH" \
+          --base "$TARGET_BRANCH" \
+          --json number,url \
+          --jq '.[0] | "\(.number) \(.url)"' 2>/dev/null || echo "")
+
+        if [[ -n "$EXISTING_PR" ]]; then
+          EXISTING_PR_NUMBER=$(echo "$EXISTING_PR" | cut -d' ' -f1)
+          EXISTING_PR_URL=$(echo "$EXISTING_PR" | cut -d' ' -f2)
+          echo "::notice::Found existing PR #$EXISTING_PR_NUMBER"
+        fi
+
+        # Build PR body
+        build_pr_body() {
+          cat <<EOF
+        ## Artifact: $ARTIFACT
+
+        Promoting changes from \`$SOURCE_BRANCH\` branch to \`$TARGET_BRANCH\`.
+
+        ### Source
+        EOF
+
+          if [[ -n "$SOURCE_PR" ]]; then
+            echo "- **Source PR**: #$SOURCE_PR"
+          else
+            echo "- **Source PR**: _(not found)_"
+          fi
+
+          cat <<EOF
+        - **Source Branch**: \`$SOURCE_BRANCH\`
+        - **Source Commit**: \`$COMMIT_SHA\`
+
+        ### Attestation Lineage
+
+        This PR carries forward the attestation chain from the source PR.
+        EOF
+
+          # Show attestation entries if present
+          if [[ -n "$ATTESTATION_MAP" && "$ATTESTATION_MAP" != "{}" ]]; then
+            echo ""
+            echo "<details>"
+            echo "<summary>Attestation entries</summary>"
+            echo ""
+            echo "\`\`\`json"
+            echo "$ATTESTATION_MAP" | jq .
+            echo "\`\`\`"
+            echo "</details>"
+          fi
+
+          cat <<EOF
+
+        <!-- ATTESTATION_MAP
+        $ATTESTATION_MAP
+        -->
+
+        ---
+        *This PR was automatically created by the atomic-branch/create-pr action.*
+        EOF
+        }
+
+        PR_BODY=$(build_pr_body)
+        PR_TITLE="chore(${ARTIFACT}): promote to ${TARGET_BRANCH}"
+
+        if [[ -n "$EXISTING_PR_NUMBER" ]]; then
+          # Update existing PR
+          echo "::notice::Updating existing PR #$EXISTING_PR_NUMBER"
+
+          gh pr edit "$EXISTING_PR_NUMBER" \
+            --title "$PR_TITLE" \
+            --body "$PR_BODY" 2>&1 || {
+            echo "::warning::Failed to update PR body, continuing..."
+          }
+
+          # Add labels if specified
+          if [[ -n "$LABELS" ]]; then
+            IFS=',' read -ra LABEL_ARRAY <<< "$LABELS"
+            for label in "${LABEL_ARRAY[@]}"; do
+              label=$(echo "$label" | xargs)  # trim whitespace
+              if [[ -n "$label" ]]; then
+                gh pr edit "$EXISTING_PR_NUMBER" --add-label "$label" 2>/dev/null || true
+              fi
+            done
+          fi
+
+          echo "pr_number=$EXISTING_PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "pr_action=updated" >> "$GITHUB_OUTPUT"
+          echo "pr_url=$EXISTING_PR_URL" >> "$GITHUB_OUTPUT"
+
+        else
+          # Create new PR
+          echo "::notice::Creating new PR for $ARTIFACT"
+
+          # Build create command
+          CREATE_ARGS=(
+            "--head" "$BRANCH"
+            "--base" "$TARGET_BRANCH"
+            "--title" "$PR_TITLE"
+            "--body" "$PR_BODY"
+          )
+
+          if [[ "$DRAFT" == "true" ]]; then
+            CREATE_ARGS+=("--draft")
+          fi
+
+          # Create PR and capture output
+          CREATE_OUTPUT=$(gh pr create "${CREATE_ARGS[@]}" 2>&1) || {
+            # Check if PR already exists (race condition)
+            RACE_PR=$(gh pr list \
+              --head "$BRANCH" \
+              --base "$TARGET_BRANCH" \
+              --json number,url \
+              --jq '.[0] | "\(.number) \(.url)"' 2>/dev/null || echo "")
+
+            if [[ -n "$RACE_PR" ]]; then
+              RACE_PR_NUMBER=$(echo "$RACE_PR" | cut -d' ' -f1)
+              RACE_PR_URL=$(echo "$RACE_PR" | cut -d' ' -f2)
+              echo "::notice::PR #$RACE_PR_NUMBER already exists (race condition)"
+
+              # Update the existing PR
+              gh pr edit "$RACE_PR_NUMBER" \
+                --title "$PR_TITLE" \
+                --body "$PR_BODY" 2>/dev/null || true
+
+              echo "pr_number=$RACE_PR_NUMBER" >> "$GITHUB_OUTPUT"
+              echo "pr_action=updated" >> "$GITHUB_OUTPUT"
+              echo "pr_url=$RACE_PR_URL" >> "$GITHUB_OUTPUT"
+              echo "::endgroup::"
+              exit 0
+            else
+              echo "::error::Failed to create PR: $CREATE_OUTPUT"
+              echo "pr_number=" >> "$GITHUB_OUTPUT"
+              echo "pr_action=failed" >> "$GITHUB_OUTPUT"
+              echo "pr_url=" >> "$GITHUB_OUTPUT"
+              echo "::endgroup::"
+              exit 1
+            fi
+          }
+
+          # Extract PR number and URL from output
+          if [[ "$CREATE_OUTPUT" =~ github.com/.*/pull/([0-9]+) ]]; then
+            NEW_PR_NUMBER="${BASH_REMATCH[1]}"
+            NEW_PR_URL="https://github.com/${GITHUB_REPOSITORY}/pull/${NEW_PR_NUMBER}"
+            echo "::notice::Created PR #$NEW_PR_NUMBER"
+          else
+            # Try to parse URL directly
+            NEW_PR_URL=$(echo "$CREATE_OUTPUT" | grep -oE 'https://github.com/[^/]+/[^/]+/pull/[0-9]+' | head -1 || echo "")
+            if [[ -n "$NEW_PR_URL" ]]; then
+              NEW_PR_NUMBER=$(echo "$NEW_PR_URL" | grep -oE '[0-9]+$')
+              echo "::notice::Created PR #$NEW_PR_NUMBER"
+            else
+              echo "::error::Could not parse PR number from output: $CREATE_OUTPUT"
+              echo "pr_number=" >> "$GITHUB_OUTPUT"
+              echo "pr_action=failed" >> "$GITHUB_OUTPUT"
+              echo "pr_url=" >> "$GITHUB_OUTPUT"
+              echo "::endgroup::"
+              exit 1
+            fi
+          fi
+
+          # Add labels if specified
+          if [[ -n "$LABELS" ]]; then
+            IFS=',' read -ra LABEL_ARRAY <<< "$LABELS"
+            for label in "${LABEL_ARRAY[@]}"; do
+              label=$(echo "$label" | xargs)
+              if [[ -n "$label" ]]; then
+                gh pr edit "$NEW_PR_NUMBER" --add-label "$label" 2>/dev/null || true
+              fi
+            done
+          fi
+
+          # Request reviewers if specified
+          if [[ -n "$REVIEWERS" ]]; then
+            IFS=',' read -ra REVIEWER_ARRAY <<< "$REVIEWERS"
+            for reviewer in "${REVIEWER_ARRAY[@]}"; do
+              reviewer=$(echo "$reviewer" | xargs)
+              if [[ -n "$reviewer" ]]; then
+                gh pr edit "$NEW_PR_NUMBER" --add-reviewer "$reviewer" 2>/dev/null || true
+              fi
+            done
+          fi
+
+          # Request team reviewers if specified
+          if [[ -n "$TEAM_REVIEWERS" ]]; then
+            IFS=',' read -ra TEAM_ARRAY <<< "$TEAM_REVIEWERS"
+            for team in "${TEAM_ARRAY[@]}"; do
+              team=$(echo "$team" | xargs)
+              if [[ -n "$team" ]]; then
+                gh pr edit "$NEW_PR_NUMBER" --add-reviewer "$team" 2>/dev/null || true
+              fi
+            done
+          fi
+
+          echo "pr_number=$NEW_PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "pr_action=created" >> "$GITHUB_OUTPUT"
+          echo "pr_url=$NEW_PR_URL" >> "$GITHUB_OUTPUT"
+        fi
+
+        echo "::endgroup::"

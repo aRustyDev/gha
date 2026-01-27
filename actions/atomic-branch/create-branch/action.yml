@@ -1,0 +1,228 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-action.json
+name: "Create Artifact Branch"
+description: "Create or update an artifact-specific branch for atomic release processing"
+author: "aRustyDev"
+
+branding:
+  icon: "git-branch"
+  color: "green"
+
+inputs:
+  artifact:
+    description: "Artifact name"
+    required: true
+  artifact-path:
+    description: "Path to artifacts directory"
+    required: true
+  branch-prefix:
+    description: "Prefix for branch name (defaults to artifact-path)"
+    required: false
+    default: ""
+  target-branch:
+    description: "Base branch for new branches"
+    required: false
+    default: "main"
+  source-sha:
+    description: "Commit SHA to copy artifact from (defaults to GITHUB_SHA)"
+    required: false
+    default: ""
+  source-pr:
+    description: "Source PR number (for commit message)"
+    required: false
+    default: ""
+  sign-commits:
+    description: "Sign commits with GPG (requires GPG setup)"
+    required: false
+    default: "false"
+  git-user-name:
+    description: "Git user name for commits"
+    required: false
+    default: "github-actions[bot]"
+  git-user-email:
+    description: "Git user email for commits"
+    required: false
+    default: "github-actions[bot]@users.noreply.github.com"
+
+outputs:
+  branch:
+    description: "Full branch name"
+    value: ${{ steps.branch.outputs.branch }}
+  updated:
+    description: "Whether the branch was updated (true/false)"
+    value: ${{ steps.branch.outputs.updated }}
+  sha:
+    description: "New branch HEAD SHA"
+    value: ${{ steps.branch.outputs.sha }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Configure git
+      shell: bash
+      env:
+        GIT_USER_NAME: ${{ inputs.git-user-name }}
+        GIT_USER_EMAIL: ${{ inputs.git-user-email }}
+      run: |
+        git config user.name "$GIT_USER_NAME"
+        git config user.email "$GIT_USER_EMAIL"
+
+    - name: Create/update artifact branch
+      id: branch
+      shell: bash
+      env:
+        ARTIFACT: ${{ inputs.artifact }}
+        ARTIFACT_PATH: ${{ inputs.artifact-path }}
+        BRANCH_PREFIX: ${{ inputs.branch-prefix }}
+        TARGET_BRANCH: ${{ inputs.target-branch }}
+        SOURCE_SHA: ${{ inputs.source-sha }}
+        SOURCE_PR: ${{ inputs.source-pr }}
+        SIGN_COMMITS: ${{ inputs.sign-commits }}
+        GITHUB_SHA: ${{ github.sha }}
+      run: |
+        set -euo pipefail
+
+        # Use provided source SHA or fall back to GITHUB_SHA
+        if [[ -z "$SOURCE_SHA" ]]; then
+          SOURCE_SHA="$GITHUB_SHA"
+        fi
+
+        # Determine branch name
+        if [[ -n "$BRANCH_PREFIX" ]]; then
+          BRANCH="${BRANCH_PREFIX}/${ARTIFACT}"
+        else
+          BRANCH="${ARTIFACT_PATH}/${ARTIFACT}"
+        fi
+
+        echo "::group::Branch operations for $ARTIFACT"
+        echo "Branch: $BRANCH"
+        echo "Source SHA: $SOURCE_SHA"
+        echo "Target branch: $TARGET_BRANCH"
+
+        # Store current branch to return to later
+        CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+        # Check if branch exists remotely
+        BRANCH_EXISTS=false
+        if git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
+          BRANCH_EXISTS=true
+          echo "::notice::Branch $BRANCH exists remotely, fetching..."
+          git fetch origin "$BRANCH"
+        fi
+
+        if [[ "$BRANCH_EXISTS" == "true" ]]; then
+          # Check if we need to update by comparing tree hashes
+          LOCAL_TREE=$(git rev-parse "${SOURCE_SHA}:${ARTIFACT_PATH}/${ARTIFACT}" 2>/dev/null || echo "none")
+          REMOTE_TREE=$(git rev-parse "origin/${BRANCH}:${ARTIFACT_PATH}/${ARTIFACT}" 2>/dev/null || echo "none")
+
+          if [[ "$LOCAL_TREE" == "$REMOTE_TREE" && "$LOCAL_TREE" != "none" ]]; then
+            echo "::notice::No changes to push for $ARTIFACT (tree hash identical)"
+            BRANCH_SHA=$(git rev-parse "origin/$BRANCH")
+            echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            echo "sha=$BRANCH_SHA" >> "$GITHUB_OUTPUT"
+            echo "::endgroup::"
+            exit 0
+          fi
+
+          # Checkout the existing branch
+          git checkout -B "$BRANCH" "origin/$BRANCH"
+        else
+          echo "::notice::Creating new branch: $BRANCH from origin/$TARGET_BRANCH"
+          git checkout -b "$BRANCH" "origin/$TARGET_BRANCH"
+        fi
+
+        # Copy the artifact directory from the source commit
+        # First, remove existing artifact content if any
+        if [[ -d "${ARTIFACT_PATH}/${ARTIFACT}" ]]; then
+          git rm -rf "${ARTIFACT_PATH}/${ARTIFACT}" || true
+        fi
+
+        # Checkout artifact from source SHA
+        git checkout "$SOURCE_SHA" -- "${ARTIFACT_PATH}/${ARTIFACT}/"
+
+        # Check if there are changes to commit
+        if git diff --cached --quiet && git diff --quiet; then
+          echo "::notice::No changes to commit for $ARTIFACT"
+          BRANCH_SHA=$(git rev-parse HEAD)
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "updated=false" >> "$GITHUB_OUTPUT"
+          echo "sha=$BRANCH_SHA" >> "$GITHUB_OUTPUT"
+
+          # Return to original branch
+          git checkout "$CURRENT_BRANCH"
+          echo "::endgroup::"
+          exit 0
+        fi
+
+        # Stage changes
+        git add "${ARTIFACT_PATH}/${ARTIFACT}/"
+
+        # Build commit message
+        COMMIT_MSG="chore(${ARTIFACT}): sync from source"
+        if [[ -n "$SOURCE_PR" ]]; then
+          COMMIT_MSG="${COMMIT_MSG}"$'\n\n'"Source-PR: #${SOURCE_PR}"
+        fi
+        COMMIT_MSG="${COMMIT_MSG}"$'\n'"Source-SHA: ${SOURCE_SHA}"
+
+        # Commit (with optional signing)
+        if [[ "$SIGN_COMMITS" == "true" ]]; then
+          git commit -S -m "$COMMIT_MSG"
+        else
+          git commit -m "$COMMIT_MSG"
+        fi
+
+        # Push with retry logic
+        MAX_RETRIES=3
+        PUSH_SUCCESS=false
+
+        for ((i=1; i<=MAX_RETRIES; i++)); do
+          echo "::notice::Push attempt $i/$MAX_RETRIES..."
+
+          if git push origin "$BRANCH" --force-with-lease 2>&1; then
+            PUSH_SUCCESS=true
+            echo "::notice::Successfully pushed $BRANCH"
+            break
+          fi
+
+          if [[ $i -lt $MAX_RETRIES ]]; then
+            echo "::warning::Push failed, fetching and rebasing..."
+            git fetch origin "$BRANCH"
+
+            # Try to rebase
+            if git rebase "origin/$BRANCH" 2>&1; then
+              echo "::notice::Rebase successful, retrying push..."
+            else
+              echo "::warning::Rebase failed, aborting and force pushing..."
+              git rebase --abort 2>/dev/null || true
+              # On final retry, we might need to force push
+              if [[ $i -eq $((MAX_RETRIES - 1)) ]]; then
+                echo "::warning::Will attempt force push on next retry"
+              fi
+            fi
+
+            # Exponential backoff
+            sleep $((i * 2))
+          fi
+        done
+
+        if [[ "$PUSH_SUCCESS" != "true" ]]; then
+          # Final attempt with force push (without lease)
+          echo "::warning::Attempting force push as last resort..."
+          if git push origin "$BRANCH" --force 2>&1; then
+            PUSH_SUCCESS=true
+            echo "::notice::Force push successful for $BRANCH"
+          else
+            echo "::error::Failed to push $BRANCH after $MAX_RETRIES attempts"
+            git checkout "$CURRENT_BRANCH"
+            exit 1
+          fi
+        fi
+
+        BRANCH_SHA=$(git rev-parse HEAD)
+        echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+        echo "updated=true" >> "$GITHUB_OUTPUT"
+        echo "sha=$BRANCH_SHA" >> "$GITHUB_OUTPUT"
+
+        # Return to original branch
+        git checkout "$CURRENT_BRANCH"
+        echo "::endgroup::"
