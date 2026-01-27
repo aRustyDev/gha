@@ -1,0 +1,84 @@
+name: "Create Attestation"
+description: "Create attestation with optional PR map update"
+author: "aRustyDev"
+
+branding:
+  icon: "shield"
+  color: "green"
+
+inputs:
+  subject-name:
+    description: "Name for the attestation subject"
+    required: true
+  subject-digest:
+    description: "SHA256 digest of the subject"
+    required: true
+  pr-number:
+    description: "PR number to update attestation map (optional)"
+    required: false
+    default: ""
+  check-name:
+    description: "Check name for attestation map entry (optional)"
+    required: false
+    default: ""
+  push-to-registry:
+    description: "Push attestation to GHCR"
+    required: false
+    default: "false"
+  token:
+    description: "GitHub token"
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  attestation-id:
+    description: "The generated attestation ID"
+    value: ${{ steps.attest.outputs.attestation-id }}
+  bundle-path:
+    description: "Path to the attestation bundle"
+    value: ${{ steps.attest.outputs.bundle-path }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Create attestation
+      id: attest
+      uses: actions/attest-build-provenance@v2
+      with:
+        subject-name: ${{ inputs.subject-name }}
+        subject-digest: ${{ inputs.subject-digest }}
+        push-to-registry: ${{ inputs.push-to-registry }}
+
+    - name: Update PR attestation map
+      if: inputs.pr-number != '' && inputs.check-name != ''
+      uses: arustydev/gha/actions/attestation/update-pr-map@main
+      with:
+        pr-number: ${{ inputs.pr-number }}
+        check-name: ${{ inputs.check-name }}
+        attestation-id: ${{ steps.attest.outputs.attestation-id }}
+        token: ${{ inputs.token }}
+
+    - name: Log attestation details
+      shell: bash
+      env:
+        SUBJECT_NAME: ${{ inputs.subject-name }}
+        SUBJECT_DIGEST: ${{ inputs.subject-digest }}
+        ATTESTATION_ID: ${{ steps.attest.outputs.attestation-id }}
+        BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        CHECK_NAME: ${{ inputs.check-name }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Attestation Details"
+        echo "Subject Name: $SUBJECT_NAME"
+        echo "Subject Digest: $SUBJECT_DIGEST"
+        echo "Attestation ID: $ATTESTATION_ID"
+        echo "Bundle Path: $BUNDLE_PATH"
+        echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        if [[ -n "$PR_NUMBER" && -n "$CHECK_NAME" ]]; then
+          echo "PR Number: $PR_NUMBER"
+          echo "Check Name: $CHECK_NAME"
+          echo "::notice::Attestation map updated for PR #$PR_NUMBER"
+        fi
+        echo "::endgroup::"

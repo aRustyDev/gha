@@ -1,0 +1,75 @@
+name: "Generate Attestation Digest"
+description: "Generate SHA256 digest for attestation subject"
+author: "aRustyDev"
+
+branding:
+  icon: "hash"
+  color: "blue"
+
+inputs:
+  content:
+    description: "Content to hash (file path or string)"
+    required: true
+  type:
+    description: "Content type: 'file' or 'string'"
+    required: false
+    default: "string"
+  algorithm:
+    description: "Hash algorithm: 'sha256' or 'sha512'"
+    required: false
+    default: "sha256"
+
+outputs:
+  digest:
+    description: "Digest in format 'algorithm:hash'"
+    value: ${{ steps.hash.outputs.digest }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Generate digest
+      id: hash
+      shell: bash
+      env:
+        CONTENT: ${{ inputs.content }}
+        TYPE: ${{ inputs.type }}
+        ALGORITHM: ${{ inputs.algorithm }}
+      run: |
+        set -euo pipefail
+
+        # Validate algorithm
+        case "$ALGORITHM" in
+          sha256|sha512)
+            ;;
+          *)
+            echo "::error::Invalid algorithm: $ALGORITHM (must be sha256 or sha512)"
+            exit 1
+            ;;
+        esac
+
+        # Select hash command
+        case "$ALGORITHM" in
+          sha256)
+            hash_cmd="sha256sum"
+            ;;
+          sha512)
+            hash_cmd="sha512sum"
+            ;;
+        esac
+
+        # Generate hash based on type
+        if [[ "$TYPE" == "file" ]]; then
+          if [[ ! -f "$CONTENT" ]]; then
+            echo "::error::File not found: $CONTENT"
+            exit 1
+          fi
+          hash=$($hash_cmd "$CONTENT" | cut -d' ' -f1)
+          echo "::notice::Generated $ALGORITHM digest for file: $CONTENT"
+        else
+          hash=$(echo -n "$CONTENT" | $hash_cmd | cut -d' ' -f1)
+          echo "::notice::Generated $ALGORITHM digest for string content"
+        fi
+
+        digest="${ALGORITHM}:${hash}"
+        echo "digest=$digest" >> "$GITHUB_OUTPUT"
+        echo "::notice::Digest: $digest"

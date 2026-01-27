@@ -1,0 +1,100 @@
+name: "Extract Attestation Map"
+description: "Extract attestation map from PR description"
+author: "aRustyDev"
+
+branding:
+  icon: "file-text"
+  color: "blue"
+
+inputs:
+  pr-number:
+    description: "PR number to extract attestation map from"
+    required: true
+  body:
+    description: "Alternative: PR body content (if already fetched)"
+    required: false
+    default: ""
+  token:
+    description: "GitHub token for API access"
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  map:
+    description: "JSON object of check_name to attestation_id"
+    value: ${{ steps.extract.outputs.map }}
+  count:
+    description: "Number of entries in the map"
+    value: ${{ steps.extract.outputs.count }}
+  empty:
+    description: "true if map is empty, false otherwise"
+    value: ${{ steps.extract.outputs.empty }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Extract attestation map
+      id: extract
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        PR_BODY: ${{ inputs.body }}
+      run: |
+        set -euo pipefail
+
+        # Get PR body either from input or API
+        if [[ -n "$PR_BODY" ]]; then
+          body="$PR_BODY"
+        else
+          if [[ -z "$PR_NUMBER" ]]; then
+            echo "::error::PR number is required when body is not provided"
+            exit 1
+          fi
+
+          body=$(gh pr view "$PR_NUMBER" --json body -q '.body' 2>/dev/null) || {
+            echo "::error::Failed to fetch PR body for PR #$PR_NUMBER"
+            exit 1
+          }
+        fi
+
+        # Extract content between attestation map markers
+        if [[ -z "$body" ]]; then
+          echo "::notice::PR body is empty, returning empty map"
+          map='{}'
+        else
+          # Extract content between markers using awk
+          map_content=$(echo "$body" | awk '
+            /<!-- ATTESTATION_MAP/,/-->/ {
+              if (!/<!-- ATTESTATION_MAP/ && !/-->/) print
+            }
+          ' | tr -d '\n' | xargs 2>/dev/null || echo "")
+
+          if [[ -z "$map_content" ]]; then
+            echo "::notice::No attestation map found in PR description"
+            map='{}'
+          else
+            # Validate JSON
+            if echo "$map_content" | jq -e . >/dev/null 2>&1; then
+              map="$map_content"
+            else
+              echo "::warning::Invalid JSON in attestation map, returning empty"
+              map='{}'
+            fi
+          fi
+        fi
+
+        # Calculate count and empty flag
+        count=$(echo "$map" | jq 'length')
+        if [[ "$count" -eq 0 ]]; then
+          empty="true"
+        else
+          empty="false"
+        fi
+
+        echo "::notice::Extracted attestation map with $count entries"
+
+        # Output results
+        echo "map=$map" >> "$GITHUB_OUTPUT"
+        echo "count=$count" >> "$GITHUB_OUTPUT"
+        echo "empty=$empty" >> "$GITHUB_OUTPUT"
