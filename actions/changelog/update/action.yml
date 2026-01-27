@@ -1,0 +1,193 @@
+name: "Update CHANGELOG.md"
+description: "Update CHANGELOG.md with a new version section following Keep-a-Changelog format"
+author: "aRustyDev"
+
+branding:
+  icon: "edit-3"
+  color: "yellow"
+
+inputs:
+  changelog-path:
+    description: "Path to CHANGELOG.md file"
+    required: true
+  version:
+    description: "Version number for the new section"
+    required: true
+  content:
+    description: "Changelog content to insert (without version header)"
+    required: true
+  date:
+    description: "Release date (YYYY-MM-DD format, defaults to today)"
+    required: false
+    default: ""
+  create-if-missing:
+    description: "Create CHANGELOG.md if it does not exist"
+    required: false
+    default: "true"
+  compare-url:
+    description: "Comparison URL to include in version header"
+    required: false
+    default: ""
+
+outputs:
+  updated:
+    description: "Whether the file was modified (true/false)"
+    value: ${{ steps.update.outputs.updated }}
+  created:
+    description: "Whether the file was created (true/false)"
+    value: ${{ steps.update.outputs.created }}
+  path:
+    description: "Full path to the changelog file"
+    value: ${{ steps.update.outputs.path }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Update changelog
+      id: update
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        CHANGELOG_PATH="${{ inputs.changelog-path }}"
+        VERSION="${{ inputs.version }}"
+        CONTENT="${{ inputs.content }}"
+        DATE="${{ inputs.date }}"
+        CREATE_IF_MISSING="${{ inputs.create-if-missing }}"
+        COMPARE_URL="${{ inputs.compare-url }}"
+
+        # Default date to today if not provided
+        if [[ -z "$DATE" ]]; then
+          DATE=$(date +%Y-%m-%d)
+        fi
+
+        echo "path=$CHANGELOG_PATH" >> "$GITHUB_OUTPUT"
+
+        # Check if file exists
+        CREATED="false"
+        if [[ ! -f "$CHANGELOG_PATH" ]]; then
+          if [[ "$CREATE_IF_MISSING" == "true" ]]; then
+            echo "::notice::Creating new CHANGELOG.md at $CHANGELOG_PATH"
+
+            # Ensure directory exists
+            mkdir -p "$(dirname "$CHANGELOG_PATH")"
+
+            # Create new changelog with header
+            cat > "$CHANGELOG_PATH" << 'HEADER'
+        # Changelog
+
+        All notable changes to this project will be documented in this file.
+
+        The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+        and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+        HEADER
+            CREATED="true"
+          else
+            echo "::error::Changelog file not found and create-if-missing is false: $CHANGELOG_PATH"
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+        fi
+
+        echo "created=$CREATED" >> "$GITHUB_OUTPUT"
+
+        # Build version header
+        VERSION_HEADER=""
+        if [[ -n "$COMPARE_URL" ]]; then
+          VERSION_HEADER="## [$VERSION]($COMPARE_URL) - $DATE"
+        else
+          VERSION_HEADER="## [$VERSION] - $DATE"
+        fi
+
+        # Check if version already exists
+        if grep -qE "^## \[$VERSION\]" "$CHANGELOG_PATH"; then
+          echo "::warning::Version $VERSION already exists in changelog, skipping"
+          echo "updated=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        echo "::group::Updating changelog with version $VERSION"
+
+        # Create the new version entry
+        NEW_ENTRY="$VERSION_HEADER
+
+        $CONTENT
+        "
+
+        # Create temp file for the result
+        TEMP_FILE=$(mktemp)
+
+        # Strategy: Insert after header section, before any existing version entries
+        # Handle [Unreleased] section if present
+        awk -v entry="$NEW_ENTRY" '
+          BEGIN {
+            inserted = 0
+            in_header = 1
+            after_unreleased = 0
+          }
+
+          # Detect end of header section (first ## line)
+          /^## / {
+            in_header = 0
+
+            # If this is [Unreleased], mark it and continue
+            if (/^## \[Unreleased\]/) {
+              print
+              after_unreleased = 1
+              next
+            }
+
+            # If we were after [Unreleased], insert before this version
+            if (after_unreleased && !inserted) {
+              print entry
+              print ""
+              inserted = 1
+            }
+
+            # If no [Unreleased] and we hit a version, insert before it
+            if (!after_unreleased && !inserted) {
+              print entry
+              print ""
+              inserted = 1
+            }
+          }
+
+          { print }
+
+          # If we processed [Unreleased] and hit an empty line, check if next is a version
+          after_unreleased && /^$/ && !inserted {
+            # Peek ahead handled by main version detection
+          }
+
+          END {
+            # If we never inserted (no existing versions), add at end
+            if (!inserted) {
+              print ""
+              print entry
+            }
+          }
+        ' "$CHANGELOG_PATH" > "$TEMP_FILE"
+
+        mv "$TEMP_FILE" "$CHANGELOG_PATH"
+
+        echo "::notice::Updated $CHANGELOG_PATH with version $VERSION"
+        echo "::endgroup::"
+
+        echo "updated=true" >> "$GITHUB_OUTPUT"
+
+    - name: Show changelog diff
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        CHANGELOG_PATH="${{ inputs.changelog-path }}"
+
+        if git diff --quiet "$CHANGELOG_PATH" 2>/dev/null; then
+          echo "::notice::No changes to changelog"
+        else
+          echo "::group::Changelog diff"
+          git diff "$CHANGELOG_PATH" || true
+          echo "::endgroup::"
+        fi

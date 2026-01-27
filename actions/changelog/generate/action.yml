@@ -1,0 +1,193 @@
+name: "Generate Changelog from Commits"
+description: "Generate changelog entries from conventional commits using git-cliff"
+author: "aRustyDev"
+
+branding:
+  icon: "git-commit"
+  color: "green"
+
+inputs:
+  artifact:
+    description: "Artifact name (used to filter commits by path)"
+    required: true
+  artifact-path:
+    description: "Path to artifacts directory (e.g., 'charts' for Helm charts)"
+    required: true
+  version:
+    description: "Version for the changelog entry (e.g., '1.3.0')"
+    required: true
+  base-ref:
+    description: "Base ref for commit range comparison"
+    required: false
+    default: "origin/main"
+  config:
+    description: "Path to git-cliff configuration file"
+    required: false
+    default: "cliff.toml"
+  output-format:
+    description: "Output format: markdown or json"
+    required: false
+    default: "markdown"
+
+outputs:
+  changelog:
+    description: "Generated changelog content"
+    value: ${{ steps.generate.outputs.changelog }}
+  commits-analyzed:
+    description: "Number of commits analyzed"
+    value: ${{ steps.generate.outputs.commits_analyzed }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install git-cliff
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if command -v git-cliff &> /dev/null; then
+          echo "::notice::git-cliff already installed: $(git-cliff --version)"
+          exit 0
+        fi
+
+        echo "::group::Installing git-cliff"
+        # Try cargo install first
+        if command -v cargo &> /dev/null; then
+          cargo install git-cliff
+        else
+          # Fallback to binary release
+          CLIFF_VERSION="2.6.1"
+          case "$(uname -s)" in
+            Linux*)
+              curl -sSfL "https://github.com/orhun/git-cliff/releases/download/v${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION}-x86_64-unknown-linux-gnu.tar.gz" | tar xz
+              sudo mv git-cliff-${CLIFF_VERSION}/git-cliff /usr/local/bin/
+              ;;
+            Darwin*)
+              curl -sSfL "https://github.com/orhun/git-cliff/releases/download/v${CLIFF_VERSION}/git-cliff-${CLIFF_VERSION}-x86_64-apple-darwin.tar.gz" | tar xz
+              sudo mv git-cliff-${CLIFF_VERSION}/git-cliff /usr/local/bin/
+              ;;
+            *)
+              echo "::error::Unsupported platform: $(uname -s)"
+              exit 1
+              ;;
+          esac
+        fi
+        echo "::endgroup::"
+
+        echo "::notice::Installed git-cliff: $(git-cliff --version)"
+
+    - name: Generate changelog
+      id: generate
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        ARTIFACT="${{ inputs.artifact }}"
+        ARTIFACT_PATH="${{ inputs.artifact-path }}"
+        VERSION="${{ inputs.version }}"
+        BASE_REF="${{ inputs.base-ref }}"
+        CONFIG="${{ inputs.config }}"
+        OUTPUT_FORMAT="${{ inputs.output-format }}"
+
+        FULL_PATH="$ARTIFACT_PATH/$ARTIFACT"
+
+        echo "::group::Analyzing commits for $ARTIFACT"
+        echo "Path: $FULL_PATH"
+        echo "Version: $VERSION"
+        echo "Base ref: $BASE_REF"
+
+        # Ensure we have the base ref
+        git fetch origin --quiet 2>/dev/null || true
+
+        # Count commits affecting this artifact
+        COMMIT_COUNT=$(git log --oneline "$BASE_REF"..HEAD -- "$FULL_PATH" 2>/dev/null | wc -l | tr -d ' ')
+        echo "Commits affecting $ARTIFACT: $COMMIT_COUNT"
+        echo "commits_analyzed=$COMMIT_COUNT" >> "$GITHUB_OUTPUT"
+
+        if [[ "$COMMIT_COUNT" -eq 0 ]]; then
+          echo "::warning::No commits found for $ARTIFACT since $BASE_REF"
+          echo "changelog=" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+          exit 0
+        fi
+
+        # Check for git-cliff config
+        CLIFF_ARGS=""
+        if [[ -f "$CONFIG" ]]; then
+          CLIFF_ARGS="--config $CONFIG"
+          echo "Using config: $CONFIG"
+        else
+          echo "::notice::No git-cliff config found at $CONFIG, using defaults"
+        fi
+
+        # Generate changelog with git-cliff
+        CHANGELOG=""
+        if command -v git-cliff &> /dev/null; then
+          CHANGELOG=$(git-cliff \
+            $CLIFF_ARGS \
+            --include-path "$FULL_PATH/**" \
+            --unreleased \
+            --tag "$ARTIFACT-v$VERSION" \
+            --strip header \
+            --strip footer \
+            2>/dev/null || true)
+        fi
+
+        # Fallback if git-cliff fails or produces no output
+        if [[ -z "$CHANGELOG" || "$CHANGELOG" == *"No commits"* ]]; then
+          echo "::warning::git-cliff produced no output, generating simple changelog"
+
+          # Generate a simple changelog from commit messages
+          COMMITS=$(git log --oneline "$BASE_REF"..HEAD -- "$FULL_PATH" 2>/dev/null | head -50)
+
+          # Group commits by type
+          FEAT_COMMITS=""
+          FIX_COMMITS=""
+          OTHER_COMMITS=""
+
+          while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            commit_msg="${line#* }"  # Remove commit hash
+
+            if [[ "$commit_msg" =~ ^feat ]]; then
+              FEAT_COMMITS+="- ${commit_msg#*: }"$'\n'
+            elif [[ "$commit_msg" =~ ^fix ]]; then
+              FIX_COMMITS+="- ${commit_msg#*: }"$'\n'
+            else
+              OTHER_COMMITS+="- $commit_msg"$'\n'
+            fi
+          done <<< "$COMMITS"
+
+          CHANGELOG="## [$VERSION] - $(date +%Y-%m-%d)"$'\n\n'
+
+          if [[ -n "$FEAT_COMMITS" ]]; then
+            CHANGELOG+="### Added"$'\n'"$FEAT_COMMITS"$'\n'
+          fi
+          if [[ -n "$FIX_COMMITS" ]]; then
+            CHANGELOG+="### Fixed"$'\n'"$FIX_COMMITS"$'\n'
+          fi
+          if [[ -n "$OTHER_COMMITS" ]]; then
+            CHANGELOG+="### Changed"$'\n'"$OTHER_COMMITS"$'\n'
+          fi
+        fi
+
+        echo "::endgroup::"
+
+        # Output format conversion
+        if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+          # Convert markdown to JSON structure
+          CHANGELOG_JSON=$(echo "$CHANGELOG" | jq -Rs '.')
+          {
+            echo "changelog<<EOF"
+            echo "$CHANGELOG_JSON"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+        else
+          {
+            echo "changelog<<EOF"
+            echo "$CHANGELOG"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+        fi
+
+        echo "::notice::Generated changelog for $ARTIFACT v$VERSION ($COMMIT_COUNT commits)"

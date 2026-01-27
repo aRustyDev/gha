@@ -1,0 +1,218 @@
+name: "Update Manifest Version"
+description: "Update the version in a manifest file (YAML, TOML, or JSON)"
+author: "aRustyDev"
+
+branding:
+  icon: "edit-3"
+  color: "orange"
+
+inputs:
+  manifest-path:
+    description: "Path to the manifest file"
+    required: true
+  new-version:
+    description: "New version to set"
+    required: true
+  version-key:
+    description: "Key name for version in manifest"
+    required: false
+    default: "version"
+  format:
+    description: "File format: 'yaml', 'toml', 'json', or 'auto' (detect from extension)"
+    required: false
+    default: "auto"
+  app-version:
+    description: "Application version to set (for Helm charts, sets appVersion)"
+    required: false
+    default: ""
+  app-version-key:
+    description: "Key name for application version"
+    required: false
+    default: "appVersion"
+  update-lockfile:
+    description: "Update associated lockfile if present (e.g., Cargo.lock, package-lock.json)"
+    required: false
+    default: "false"
+
+outputs:
+  updated:
+    description: "'true' if the file was modified"
+    value: ${{ steps.update.outputs.updated }}
+  previous-version:
+    description: "Version before update"
+    value: ${{ steps.update.outputs.previous-version }}
+  lockfile-updated:
+    description: "'true' if a lockfile was also updated"
+    value: ${{ steps.update.outputs.lockfile-updated }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Update Manifest
+      id: update
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        MANIFEST_PATH="${{ inputs.manifest-path }}"
+        NEW_VERSION="${{ inputs.new-version }}"
+        VERSION_KEY="${{ inputs.version-key }}"
+        FORMAT="${{ inputs.format }}"
+        APP_VERSION="${{ inputs.app-version }}"
+        APP_VERSION_KEY="${{ inputs.app-version-key }}"
+        UPDATE_LOCKFILE="${{ inputs.update-lockfile }}"
+
+        echo "::group::Updating manifest version"
+        echo "Manifest: $MANIFEST_PATH"
+        echo "New version: $NEW_VERSION"
+        echo "Version key: $VERSION_KEY"
+        echo "Format: $FORMAT"
+
+        # Validate manifest exists
+        if [[ ! -f "$MANIFEST_PATH" ]]; then
+          echo "::error::Manifest file not found: $MANIFEST_PATH"
+          exit 1
+        fi
+
+        # Auto-detect format from extension
+        if [[ "$FORMAT" == "auto" ]]; then
+          case "$MANIFEST_PATH" in
+            *.yaml|*.yml)
+              FORMAT="yaml"
+              ;;
+            *.toml)
+              FORMAT="toml"
+              ;;
+            *.json)
+              FORMAT="json"
+              ;;
+            *)
+              echo "::error::Cannot auto-detect format for: $MANIFEST_PATH"
+              exit 1
+              ;;
+          esac
+          echo "Auto-detected format: $FORMAT"
+        fi
+
+        # Get previous version
+        PREVIOUS_VERSION=""
+        case "$FORMAT" in
+          yaml)
+            # Use grep/awk for robustness (yq can change formatting)
+            PREVIOUS_VERSION=$(grep "^${VERSION_KEY}:" "$MANIFEST_PATH" | head -1 | awk '{print $2}' | tr -d '"' | tr -d "'")
+            ;;
+          toml)
+            # Handle both [package] section and root level
+            PREVIOUS_VERSION=$(grep "^${VERSION_KEY}[[:space:]]*=" "$MANIFEST_PATH" | head -1 | sed 's/.*=[[:space:]]*"\?\([^"]*\)"\?.*/\1/')
+            ;;
+          json)
+            PREVIOUS_VERSION=$(jq -r ".${VERSION_KEY} // empty" "$MANIFEST_PATH")
+            ;;
+        esac
+
+        if [[ -z "$PREVIOUS_VERSION" ]]; then
+          echo "::warning::Could not find previous version in $MANIFEST_PATH"
+          PREVIOUS_VERSION="unknown"
+        fi
+
+        echo "Previous version: $PREVIOUS_VERSION"
+
+        # Check if update is needed
+        if [[ "$PREVIOUS_VERSION" == "$NEW_VERSION" ]]; then
+          echo "::notice::Version already set to $NEW_VERSION, no update needed"
+          echo "updated=false" >> "$GITHUB_OUTPUT"
+          echo "previous-version=$PREVIOUS_VERSION" >> "$GITHUB_OUTPUT"
+          echo "lockfile-updated=false" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+          exit 0
+        fi
+
+        # Update version based on format
+        UPDATED="false"
+        case "$FORMAT" in
+          yaml)
+            # Use sed for YAML to preserve formatting
+            # Handle both quoted and unquoted values
+            if grep -q "^${VERSION_KEY}:[[:space:]]*['\"]" "$MANIFEST_PATH"; then
+              # Quoted value
+              sed -i.bak "s/^${VERSION_KEY}:[[:space:]]*['\"][^'\"]*['\"]/${VERSION_KEY}: \"${NEW_VERSION}\"/" "$MANIFEST_PATH"
+            else
+              # Unquoted value
+              sed -i.bak "s/^${VERSION_KEY}:[[:space:]]*.*$/${VERSION_KEY}: ${NEW_VERSION}/" "$MANIFEST_PATH"
+            fi
+            rm -f "${MANIFEST_PATH}.bak"
+            UPDATED="true"
+
+            # Handle appVersion for Helm charts
+            if [[ -n "$APP_VERSION" ]]; then
+              if grep -q "^${APP_VERSION_KEY}:" "$MANIFEST_PATH"; then
+                if grep -q "^${APP_VERSION_KEY}:[[:space:]]*['\"]" "$MANIFEST_PATH"; then
+                  sed -i.bak "s/^${APP_VERSION_KEY}:[[:space:]]*['\"][^'\"]*['\"]/${APP_VERSION_KEY}: \"${APP_VERSION}\"/" "$MANIFEST_PATH"
+                else
+                  sed -i.bak "s/^${APP_VERSION_KEY}:[[:space:]]*.*$/${APP_VERSION_KEY}: ${APP_VERSION}/" "$MANIFEST_PATH"
+                fi
+                rm -f "${MANIFEST_PATH}.bak"
+                echo "::notice::Updated $APP_VERSION_KEY to $APP_VERSION"
+              fi
+            fi
+            ;;
+
+          toml)
+            # Use sed for TOML
+            sed -i.bak "s/^${VERSION_KEY}[[:space:]]*=.*/${VERSION_KEY} = \"${NEW_VERSION}\"/" "$MANIFEST_PATH"
+            rm -f "${MANIFEST_PATH}.bak"
+            UPDATED="true"
+            ;;
+
+          json)
+            # Use jq for JSON
+            TEMP_FILE=$(mktemp)
+            jq ".${VERSION_KEY} = \"${NEW_VERSION}\"" "$MANIFEST_PATH" > "$TEMP_FILE"
+            mv "$TEMP_FILE" "$MANIFEST_PATH"
+            UPDATED="true"
+            ;;
+        esac
+
+        # Handle lockfile updates
+        LOCKFILE_UPDATED="false"
+        if [[ "$UPDATE_LOCKFILE" == "true" ]]; then
+          MANIFEST_DIR=$(dirname "$MANIFEST_PATH")
+          MANIFEST_NAME=$(basename "$MANIFEST_PATH")
+
+          case "$MANIFEST_NAME" in
+            Cargo.toml)
+              if [[ -f "$MANIFEST_DIR/Cargo.lock" ]]; then
+                echo "::notice::Updating Cargo.lock..."
+                (cd "$MANIFEST_DIR" && cargo update --offline 2>/dev/null || cargo generate-lockfile 2>/dev/null || true)
+                if [[ -f "$MANIFEST_DIR/Cargo.lock" ]]; then
+                  LOCKFILE_UPDATED="true"
+                fi
+              fi
+              ;;
+            package.json)
+              if [[ -f "$MANIFEST_DIR/package-lock.json" ]]; then
+                echo "::notice::Updating package-lock.json..."
+                (cd "$MANIFEST_DIR" && npm install --package-lock-only 2>/dev/null || true)
+                LOCKFILE_UPDATED="true"
+              elif [[ -f "$MANIFEST_DIR/yarn.lock" ]]; then
+                echo "::notice::yarn.lock present but not auto-updated (run yarn install manually)"
+              fi
+              ;;
+            pyproject.toml)
+              if [[ -f "$MANIFEST_DIR/poetry.lock" ]]; then
+                echo "::notice::Updating poetry.lock..."
+                (cd "$MANIFEST_DIR" && poetry lock --no-update 2>/dev/null || true)
+                LOCKFILE_UPDATED="true"
+              fi
+              ;;
+          esac
+        fi
+
+        echo "::endgroup::"
+
+        # Set outputs
+        echo "updated=$UPDATED" >> "$GITHUB_OUTPUT"
+        echo "previous-version=$PREVIOUS_VERSION" >> "$GITHUB_OUTPUT"
+        echo "lockfile-updated=$LOCKFILE_UPDATED" >> "$GITHUB_OUTPUT"
+
+        echo "::notice::Updated $MANIFEST_PATH: $PREVIOUS_VERSION -> $NEW_VERSION"
