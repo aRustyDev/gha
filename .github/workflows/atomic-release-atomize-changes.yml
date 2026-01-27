@@ -103,15 +103,12 @@ jobs:
         env:
           ARTIFACT_PATH: ${{ inputs.artifact_path }}
           MANIFEST_FILE: ${{ inputs.manifest_file }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
         run: |
-          # Handle both squash merges and merge commits
-          if git rev-parse HEAD^2 >/dev/null 2>&1; then
-            RANGE="HEAD^..HEAD"
-            echo "::notice::Detected merge commit, using range: $RANGE"
-          else
-            RANGE="HEAD~1..HEAD"
-            echo "::notice::Detected squash/regular commit, using range: $RANGE"
-          fi
+          # Compare against target branch to detect ALL changes needing atomization
+          # This ensures we don't miss changes when multiple commits merge in sequence
+          RANGE="origin/${TARGET_BRANCH}..HEAD"
+          echo "::notice::Detecting changes using range: $RANGE"
 
           # Get all changed files
           CHANGED_FILES=$(git diff --name-only "$RANGE")
