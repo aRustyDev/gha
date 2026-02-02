@@ -143,7 +143,7 @@ jobs:
           echo "::notice::Version: $VERSION"
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ steps.parse.outputs.tag }}
 
@@ -226,7 +226,7 @@ jobs:
       digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Checkout Tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ needs.validate-tag.outputs.tag }}
 
