@@ -343,7 +343,7 @@ jobs:
 
       - name: Generate test attestation
         if: success()
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v3
         with:
           subject-name: "atomic-pr-test"
           subject-digest: ${{ steps.digest.outputs.digest }}

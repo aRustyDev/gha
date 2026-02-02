@@ -453,7 +453,7 @@ jobs:
 
       - name: Create attestation
         id: attestation
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v3
         with:
           subject-name: "atomize-changes"
           subject-digest: ${{ steps.digest.outputs.digest }}
